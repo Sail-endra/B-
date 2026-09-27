@@ -22,13 +22,13 @@ function patternFor(origin) {
 async function initialize() {
   const cpPermission = await chrome.permissions.contains({ origins: [copilotOrigin] });
   copilotConnected = cpPermission;
-  copilotButton.textContent = cpPermission ? "Disconnect Course Copilot" : "Connect Course Copilot";
+  copilotButton.textContent = cpPermission ? "Disconnect AI Lookup Chat" : "Connect AI Lookup Chat";
   copilotButton.className = cpPermission ? "secondary" : "";
   if (cpPermission) {
     const cpReply = await chrome.runtime.sendMessage({ type: "BBX_CP_STATE" });
     copilotStatus.textContent = cpReply?.ok
-      ? "Connected to Course Copilot."
-      : (cpReply?.error || "Permission is on, but Course Copilot is not responding.");
+      ? "Connected to AI Lookup Chat."
+      : (cpReply?.error || "Permission is on, but AI Lookup Chat is not responding.");
     copilotStatus.className = cpReply?.ok ? "small ok" : "small error";
   } else {
     copilotStatus.textContent = "Optional: connect to sync materials and ask questions from Blackboard.";
@@ -119,19 +119,19 @@ copilotButton.addEventListener("click", async () => {
     if (copilotConnected) {
       await chrome.permissions.remove({ origins: [copilotOrigin] });
       copilotConnected = false;
-      copilotStatus.textContent = "Disconnected from Course Copilot.";
+      copilotStatus.textContent = "Disconnected from AI Lookup Chat.";
       copilotStatus.className = "small";
-      copilotButton.textContent = "Connect Course Copilot";
+      copilotButton.textContent = "Connect AI Lookup Chat";
       copilotButton.className = "secondary";
     } else {
       const accepted = await chrome.permissions.request({ origins: [copilotOrigin] });
-      if (!accepted) throw new Error("Local Course Copilot access was not granted.");
+      if (!accepted) throw new Error("Local AI Lookup Chat access was not granted.");
       copilotConnected = true;
-      copilotButton.textContent = "Disconnect Course Copilot";
+      copilotButton.textContent = "Disconnect AI Lookup Chat";
       copilotButton.className = "secondary";
       const reply = await chrome.runtime.sendMessage({ type: "BBX_CP_STATE" });
       if (!reply?.ok) {
-        copilotStatus.textContent = reply?.error || "Course Copilot did not respond. Start the local server, then retry in the drawer.";
+        copilotStatus.textContent = reply?.error || "AI Lookup Chat did not respond. Start the local server, then retry in the drawer.";
         copilotStatus.className = "small error";
         return;
       }

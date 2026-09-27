@@ -101,6 +101,7 @@ def test_bbplus_mapping_sync_ingest_poll_retrieval_and_idempotency(tmp_path, mon
         assert first.status_code == 200, first.text
         first_job = _wait_for_job(client, first.json()["job_id"])
         assert first_job["status"] == "done"
+        assert {item["item_id"] for item in first_job["files"]} == {"bb-item-41", "bb-item-42"}
         assert len(store.sources("alice", course_id)) == 2
         assert all(source.type is SourceType.BBPLUS for source in store.sources("alice", course_id))
         first_chunks = store.chunk_count_for_course("alice", course_id)
@@ -169,6 +170,33 @@ def test_bbplus_mapping_and_materials_are_scoped_by_user(tmp_path, monkeypatch):
         assert store.bbplus_course_mapping("alice", "colliding-id") is None
         assert store.bbplus_course_mapping("bob", "colliding-id")["course_id"] == "econ303"
         assert store.course("bob", "econ303") is not None
+    finally:
+        client.close()
+        store.close()
+
+
+def test_unreadable_bbplus_material_does_not_block_its_batch(tmp_path, monkeypatch):
+    store = SQLiteStore(tmp_path / "partial-batch.sqlite")
+    monkeypatch.setattr(main, "get_store", lambda: store)
+    monkeypatch.setattr(main, "current_user", lambda: "alice")
+    monkeypatch.setattr(main, "UPLOAD_DIR", tmp_path / "uploads")
+    client = TestClient(main.app)
+    try:
+        store.upsert_course_stub("alice", "econ303", "ECON303", "Micro")
+        store.set_bbplus_course_mapping("alice", "bb-course", "Micro", "econ303")
+        response = client.post(
+            "/api/integrations/bbplus/course-mappings/bb-course/materials",
+            json={"documents": [
+                {"item_id": "empty-item", "course_id": "bb-course", "title": "Empty", "blocks": []},
+                {"item_id": "good-item", "course_id": "bb-course", "title": "Readable", "blocks": _blocks("consumer budget constraint")},
+            ]},
+        )
+        assert response.status_code == 200, response.text
+        assert [item["item_id"] for item in response.json()["skipped"]] == ["empty-item"]
+        job = _wait_for_job(client, response.json()["job_id"])
+        assert job["status"] == "done"
+        assert [item["item_id"] for item in job["files"]] == ["good-item"]
+        assert store.chunk_count_for_course("alice", "econ303") > 0
     finally:
         client.close()
         store.close()

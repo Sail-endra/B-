@@ -26,3 +26,5 @@ PDF/DOCX/PPTX files under the MV3 extension-page CSP
 extracted, zero CSP violations. `offscreen.js` passes
 `isEvalSupported: false` to pdf.js so it never compiles fonts with
 `new Function()`.
+
+- katex.min.js — KaTeX 0.16.11 (cdnjs). Used in content.js to typeset answer math via MathML output (rendered natively by the browser; no CSS/fonts needed).

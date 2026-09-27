@@ -93,6 +93,7 @@ class ExtractedDoc:
     page_count: int = 0
     warnings: list[str] = field(default_factory=list)
     ocr_pages: int = 0
+    ocr_seconds: float = 0.0
     ocr_unavailable: bool = False
     failed: bool = False
     failure_reason: str = ""
@@ -311,6 +312,7 @@ def _extract_pdf(path: Path, source_id: str, on_page: ProgressFn = None) -> Extr
     if needs:
         ocr = ocr_pages(pdf, needs, on_page=on_page)
         doc.ocr_pages = ocr.succeeded
+        doc.ocr_seconds = ocr.seconds
         if not ocr.available:
             # Not fatal on its own. A 806-page text-native textbook with four
             # image-only plates must not be reported as a failed upload because

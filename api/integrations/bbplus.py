@@ -10,10 +10,17 @@ from typing import Any
 MAX_DOCUMENT_CHARS = 2_000_000
 
 
-def safe_material_filename(item_id: str, title: str = "") -> str:
-    """Stable per Blackboard item. The display title stays in the file content."""
+def safe_material_filename(item_id: str, title: str = "", ext: str = ".md") -> str:
+    """Stable per Blackboard item. The display title stays in the file content.
+
+    `ext` lets a raw file (a .pdf/.docx sent for server-side extraction) keep its
+    extension so the extractor picks the right parser; the item-id hash — the
+    same one the sidebar recomputes to link a citation to Blackboard — is
+    unchanged, so a file and its earlier .md never collide on the hash alone.
+    """
     item_hash = hashlib.sha256(item_id.encode("utf-8")).hexdigest()[:16]
-    return f"bbplus_{item_hash}.md"
+    ext = ext if ext.startswith(".") else f".{ext}"
+    return f"bbplus_{item_hash}{ext.lower()}"
 
 
 def serialize_document(title: str, blocks: list[dict[str, Any]]) -> str:

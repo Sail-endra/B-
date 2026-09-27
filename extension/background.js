@@ -120,7 +120,7 @@ async function queryLibrary(query) {
   };
 }
 
-// ---- Course Copilot service adapter -------------------------------------
+// ---- AI Lookup Chat service adapter -------------------------------------
 // The extension owns Blackboard discovery and local structured IR. Course
 // Copilot remains canonical for indexed chunks, retrieval, and answers.
 const COURSE_COPILOT_ORIGIN = "http://127.0.0.1:8471";
@@ -129,7 +129,7 @@ const COURSE_COPILOT_PERMISSION = `${COURSE_COPILOT_ORIGIN}/*`;
 async function courseCopilotFetch(path, options = {}) {
   const granted = await chrome.permissions.contains({ origins: [COURSE_COPILOT_PERMISSION] });
   if (!granted) {
-    throw new Error("Course Copilot is not connected. Open the BB Plus extension menu and connect it first.");
+    throw new Error("AI Lookup Chat is not connected. Open the B+ extension menu and connect it first.");
   }
   let response;
   try {
@@ -139,22 +139,24 @@ async function courseCopilotFetch(path, options = {}) {
       credentials: "omit"
     });
   } catch (error) {
-    throw new Error(`Could not reach Course Copilot at 127.0.0.1:8471. Start the local server and retry. ${error?.message || ""}`.trim());
+    throw new Error(`Could not reach AI Lookup Chat at 127.0.0.1:8471. Start the local server and retry. ${error?.message || ""}`.trim());
   }
   let body = {};
   try { body = await response.json(); } catch (_) {}
   if (!response.ok) {
     const detail = body?.detail;
     const message = typeof detail === "string" ? detail : detail?.message;
-    throw new Error(message || `Course Copilot returned HTTP ${response.status}.`);
+    throw new Error(message || `AI Lookup Chat returned HTTP ${response.status}.`);
   }
   return body;
 }
 
-async function syncLibraryToCourseCopilot(blackboardCourseId) {
-  const docs = await BBDB.listDocumentsByCourse(blackboardCourseId);
-  if (!docs.length) throw new Error("BB Plus has no saved materials for this course yet. Build the study library first.");
-  if (docs.length > 100) throw new Error("This course has more than 100 saved items. Sync smaller groups from the Course Copilot materials page.");
+async function syncLibraryToCourseCopilot(blackboardCourseId, itemIds = null) {
+  const allDocs = await BBDB.listDocumentsByCourse(blackboardCourseId);
+  const wanted = Array.isArray(itemIds) ? new Set(itemIds.map(String)) : null;
+  const docs = wanted ? allDocs.filter((doc) => wanted.has(String(doc.itemId))) : allDocs;
+  if (!docs.length) throw new Error("B+ has no saved materials for this course yet. Build the study library first.");
+  if (docs.length > 100) throw new Error("This course has more than 100 saved items. Sync smaller groups from the AI Lookup Chat materials page.");
   const documents = docs.map((doc) => ({
     item_id: doc.itemId,
     course_id: doc.courseId,
@@ -221,7 +223,7 @@ async function registerOrigin(origin) {
     {
       id: scriptId(origin, "content"),
       matches,
-      js: ["lib/stage.js", "lib/audit.js", "content.js"],
+      js: ["vendor/katex.min.js", "lib/stage.js", "lib/audit.js", "lib/work.js", "content.js"],
       css: ["styles.css"],
       runAt: "document_start",
       world: "ISOLATED",
@@ -282,7 +284,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message?.type === "BBX_CP_SYNC_COURSE") {
-      sendResponse({ ok: true, ...(await syncLibraryToCourseCopilot(message.blackboardCourseId)) });
+      sendResponse({ ok: true, ...(await syncLibraryToCourseCopilot(message.blackboardCourseId, message.itemIds)) });
+      return;
+    }
+
+    if (message?.type === "BBX_CP_INGEST_FILES") {
+      // Hand a batch of raw PDF/DOCX files to the backend's PyMuPDF+OCR
+      // extractor as one ingest job.
+      const body = await courseCopilotFetch(
+        `/api/integrations/bbplus/course-mappings/${encodeURIComponent(message.blackboardCourseId)}/materials/files`,
+        { method: "POST", body: JSON.stringify({ files: message.files || [] }) }
+      );
+      sendResponse({ ok: true, ...body });
       return;
     }
 

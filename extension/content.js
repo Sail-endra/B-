@@ -4,6 +4,14 @@
   window.__BBX_CONTENT_INSTALLED__ = true;
 
   const STORAGE_KEY = `bbx_data::${location.origin}`;
+  // Developer diagnostics (the course/raw-JSON tabs, the manual "Build study
+  // library"/"Verify library" actions, the Student/Debug toggle) are hidden
+  // from the normal student experience. They come back only when the page URL
+  // carries ?bbxdev=1, and nothing about that is persisted.
+  const DEV_MODE = new URLSearchParams(location.search).get("bbxdev") === "1";
+  // The local AI Lookup Chat backend (matches background.js). Citations link
+  // straight to the stored source file it serves.
+  const COURSE_COPILOT_ORIGIN = "http://127.0.0.1:8471";
   const TERM_RE = /\b(spring|summer|fall|autumn|winter)\s+(20\d{2})\b/i;
   const REVERSE_TERM_RE = /\b(20\d{2})\s+(spring|summer|fall|autumn|winter)\b/i;
   const MAX = {
@@ -46,8 +54,25 @@
   let saveTimer = null;
   let renderTimer = null;
   let scanTimer = null;
-  let preloadTimer = null;
   let preloadRunning = false;
+  // The single authoritative auto-preparation lifecycle (see prepareAllCourses):
+  // discovery → mapping → material sync → library compilation, run for every
+  // current course with the active one prioritized. These guard against the
+  // sweep stacking on itself when discovery events arrive in bursts.
+  let prepareSweepScheduled = false;
+  let prepareSweepRunning = false;
+  let prepareSweepRerun = false;
+  const activePreparation = new Map();
+  const activePreparationStatus = new Map();
+  const activePreparationReadyIds = new Map();
+  const activePreparationFailedIds = new Map();
+  const activePreparationSignatures = new Map();
+  const activePreparationIsPartial = new Map();
+  const activePreparationQueries = new Map();
+  const queuedActivePreparations = new Map();
+  const activePreparedDescriptors = new Map();
+  const courseMappingTasks = new Map();
+  const courseMappingCache = new Map();
 
   const DIAG_LIMIT = 80;
 
@@ -154,6 +179,8 @@
         const u = new URL(sourceUrl, location.href);
         if (u.origin === location.origin) state.courseListEndpoints.add(u.href);
       } catch (_) {}
+      // New courses observed in live Blackboard traffic — prepare them too.
+      schedulePrepareAllCourses("network-discovery");
     }
     return learned;
   }
@@ -671,7 +698,7 @@
       state.diagnosticTab = ["courses", "courseData", "raw", "page"].includes(stored.diagnosticTab)
         ? stored.diagnosticTab
         : "courses";
-      state.uiMode = stored.uiMode === "debug" ? "debug" : "student";
+      state.uiMode = (DEV_MODE && stored.uiMode === "debug") ? "debug" : "student";
       state.studentSelectedCourse = firstText(stored.studentSelectedCourse);
       for (const record of stored.exactCourses || []) rememberExactCourse(record);
       for (const endpoint of stored.courseListEndpoints || []) {
@@ -1136,11 +1163,23 @@
       exactCoursesLearned: learnedExact
     });
     changed();
-
-    if (learnedExact > 0) scheduleCoursePreload(350);
+    if (learnedExact) refreshStudentListIfIdle();
 
     ingestJson(message.body, message.url || "network");
   });
+
+  // Show a newly discovered class in the list without disrupting a student who
+  // is mid-question: only repaint the class-list view (no class open), and only
+  // when the visible set of classes is actually stale.
+  let listRefreshTimer = null;
+  function refreshStudentListIfIdle() {
+    clearTimeout(listRefreshTimer);
+    listRefreshTimer = setTimeout(() => {
+      if (state.uiMode !== "student" || state.studentSelectedCourse) return;
+      const shown = document.querySelectorAll(".bbx-student-course").length;
+      if (shown !== studentCourseRecords().length) render();
+    }, 400);
+  }
 
   function ensureUi() {
     if (document.getElementById("bbx-root")) return;
@@ -1151,16 +1190,16 @@
     const launcher = document.createElement("button");
     launcher.id = "bbx-launcher";
     launcher.type = "button";
-    launcher.setAttribute("aria-label", "Open BB Plus");
+    launcher.setAttribute("aria-label", "Open B+");
 
     const launcherImage = document.createElement("img");
     launcherImage.src = chrome.runtime.getURL("bb-plus.png");
-    launcherImage.alt = "BB Plus";
+    launcherImage.alt = "B+";
     launcher.append(launcherImage);
 
     const drawer = document.createElement("aside");
     drawer.id = "bbx-drawer";
-    drawer.setAttribute("aria-label", "Study Hub");
+    drawer.setAttribute("aria-label", "B+");
     drawer.setAttribute("aria-hidden", "true");
 
     const header = document.createElement("div");
@@ -1169,7 +1208,7 @@
     const heading = document.createElement("div");
     heading.className = "bbx-brand";
     const title = document.createElement("h2");
-    title.textContent = "Bb Plus";
+    title.textContent = "B+";
     heading.append(title);
 
     const modeToggle = document.createElement("button");
@@ -1205,15 +1244,19 @@
 
     const headerButtons = document.createElement("div");
     headerButtons.className = "bbx-header-buttons";
+    headerButtons.id = "bbx-header-tools";
     headerButtons.append(ingestButton, verifyButton);
 
     const close = document.createElement("button");
     close.className = "bbx-close";
     close.type = "button";
-    close.setAttribute("aria-label", "Close Study Hub");
+    close.setAttribute("aria-label", "Close B+");
     close.textContent = "×";
 
-    header.append(heading, headerButtons, modeToggle, close);
+    // The developer view toggle and its diagnostic buttons only exist under
+    // ?bbxdev=1. Students never see setup controls; preparation is automatic.
+    if (DEV_MODE) header.append(heading, headerButtons, modeToggle, close);
+    else header.append(heading, close);
 
     const termBar = document.createElement("div");
     termBar.id = "bbx-term-bar";
@@ -1631,7 +1674,7 @@
   function syncSelectedTermToExactCourses(records) {
     const terms = availableExactTerms(records);
 
-    // Preserve an explicit valid Study Hub selection. The current Blackboard
+    // Preserve an explicit valid B+ selection. The current Blackboard
     // page term is only an initializer/fallback, not an override.
     if (state.selectedTerm && terms.includes(state.selectedTerm)) return;
 
@@ -1687,7 +1730,9 @@
       }
     }
     changed();
-    scheduleCoursePreload(250);
+    // Blackboard has just told us which courses exist: kick the automatic
+    // discover → map → sync → compile lifecycle for all of them.
+    schedulePrepareAllCourses("course-list");
   }
 
   function collectSameOriginUrls(value, out = new Set(), depth = 0, seen = new WeakSet()) {
@@ -2852,18 +2897,9 @@
     changed();
   }
 
-  function scheduleCoursePreload(delay = 500) {
-    clearTimeout(preloadTimer);
-    preloadTimer = setTimeout(() => {
-      preloadKnownCourses().catch((error) => {
-        diagEvent("preload-error", { error: String(error?.message || error) });
-      });
-    }, delay);
-  }
-
   async function preloadKnownCourses(recordsOverride = null) {
     if (preloadRunning) return;
-    const records = Array.isArray(recordsOverride)
+    let records = Array.isArray(recordsOverride)
       ? recordsOverride
       : exactCourseRecordsFromNetwork();
     if (!records.length) return;
@@ -2877,7 +2913,7 @@
 
       // A few courses in parallel is substantially faster than serial loading
       // without creating a huge burst of requests against Blackboard.
-      const CONCURRENCY = 4;
+      const CONCURRENCY = 2;
       let cursor = 0;
 
       async function worker() {
@@ -3044,15 +3080,25 @@
 
     const MAX_REQUESTS = fast ? 220 : 260;
 
+    const REQUEST_CONCURRENCY = 4;
+    let lastPartialSignature = "";
+    let lastPartialRequestCount = 0;
     while (
       (critical.length || high.length || normal.length || low.length) &&
       result.attempts.length < MAX_REQUESTS
     ) {
-      const url = nextUrl();
-      if (!url || seenUrls.has(url)) continue;
-      seenUrls.add(url);
-
-      const attempt = await probeOneUrl(url);
+      const batchUrls = [];
+      while (batchUrls.length < REQUEST_CONCURRENCY &&
+             result.attempts.length + batchUrls.length < MAX_REQUESTS &&
+             (critical.length || high.length || normal.length || low.length)) {
+        const url = nextUrl();
+        if (!url || seenUrls.has(url)) continue;
+        seenUrls.add(url);
+        batchUrls.push(url);
+      }
+      if (!batchUrls.length) break;
+      const attempts = await BBCourseWork.mapLimit(batchUrls, REQUEST_CONCURRENCY, probeOneUrl);
+      for (const attempt of attempts) {
       result.attempts.push(attempt);
       if (!(attempt.ok && attempt.body && typeof attempt.body === "object")) continue;
 
@@ -3065,7 +3111,7 @@
       result.contentNodes.push(...nodes);
       result.fileCandidates.push(...foundFiles);
 
-      const lowerUrl = url.toLowerCase();
+      const lowerUrl = attempt.url.toLowerCase();
 
       for (const node of nodes) {
         const kind = ultraNodeKind(node);
@@ -3150,6 +3196,36 @@
                 "high"
               );
             }
+          }
+        }
+      }
+      }
+      if (typeof options.onDiscovery === "function") {
+        const partialOutline = buildCourseOutline(result.contentNodes, result.fileCandidates, record);
+        const partialJobs = buildCourseIngestJobs(record, partialOutline).filter((item) =>
+          item.kind === "fetch" || item.kind === "markup" ||
+          (item.kind === "unresolved" && item.reason === "no-download-url" && item.parentId)
+        );
+        const signature = partialJobs.map((item) => `${item.itemId}:${item.kind}:${item.url || ""}`).sort().join("|");
+        const enoughNewWork = !lastPartialSignature ||
+          result.attempts.length - lastPartialRequestCount >= 12;
+        if (partialJobs.length && signature !== lastPartialSignature && enoughNewWork) {
+          lastPartialSignature = signature;
+          lastPartialRequestCount = result.attempts.length;
+          try {
+            options.onDiscovery({
+              ...result,
+              attempts: result.attempts.slice(),
+              contentNodes: result.contentNodes.slice(),
+              fileCandidates: result.fileCandidates.slice(),
+              outline: partialOutline,
+              partial: true
+            });
+          } catch (error) {
+            diagEvent("course-probe-partial-update-failed", {
+              course: record.displayName,
+              error: String(error?.message || error)
+            });
           }
         }
       }
@@ -3324,7 +3400,7 @@
       empty.className = "bbx-empty-state";
       empty.textContent =
         "No captured body.results[*].course objects match this term yet. " +
-        "Browse the Blackboard Courses page for that term and reopen Study Hub.";
+        "Browse the Blackboard Courses page for that term and reopen B+.";
       container.append(empty);
       return;
     }
@@ -3553,7 +3629,7 @@
       empty.className = "bbx-empty-state";
       empty.textContent =
         "No probe has run yet. Run this from /Ultra/Course first. If content is incomplete, " +
-        "enter the course, open Course Content and one folder/module, then reopen Study Hub and probe again.";
+        "enter the course, open Course Content and one folder/module, then reopen B+ and probe again.";
       container.append(empty);
       return;
     }
@@ -3988,6 +4064,16 @@
     return { itemId, title, kind: "unresolved", reason: `unhandled-item-type:${item.type || "unknown"}`, url };
   }
 
+  // A fetch job likely to be a PDF, from the signals available before download.
+  // PDFs are routed to the backend's PyMuPDF+OCR extractor; anything we are not
+  // sure about stays on the in-browser path, so we never double-download.
+  function _looksPdf(item) {
+    const mime = (item.mimeType || "").toLowerCase();
+    if (mime.includes("pdf")) return true;
+    const hay = `${item.title || ""} ${item.url || ""} ${item.filename || ""}`.toLowerCase();
+    return /\.pdf(\?|#|$)/.test(hay);
+  }
+
   // Walks the course outline to produce ingest job *descriptors*: nothing is fetched
   // here, that happens in the worker pool in runIngest() below so fetch
   // concurrency stays bounded regardless of how large a course's outline is.
@@ -4019,7 +4105,7 @@
   // authoritative "is everything really in there" answer: every indexable
   // leaf either shows up in the library or shows up in `missing`, full stop.
   // "Verify library" - an audit, not just a lookup. Earlier builds only
-  // compared the library with BB Plus's own scan, so anything the scan
+  // compared the library with B+'s own scan, so anything the scan
   // missed was invisible to both and the result still said "all present".
   // Per course this checks, with independent evidence where possible:
   //   1. census:   everything Ultra's own folder listing shows vs. the scan
@@ -4045,7 +4131,7 @@
       report.push(course);
 
       if (!outline.length && state.courseProbeStatus.get(key) !== "done") {
-        course.problems.push({ check: "scan", text: "BB Plus could not scan this course at all." });
+        course.problems.push({ check: "scan", text: "B+ could not scan this course at all." });
         continue;
       }
 
@@ -4128,7 +4214,7 @@
   }
 
   function verifyReportText(report) {
-    const lines = [`BB Plus ${chrome.runtime.getManifest().version} verify report — ${new Date().toISOString()}`, ""];
+    const lines = [`B+ ${chrome.runtime.getManifest().version} verify report — ${new Date().toISOString()}`, ""];
     for (const c of report || []) {
       lines.push(`== ${c.courseName}: library ${c.indexedCount ?? "?"}/${c.indexableCount ?? "?"} · census ${c.censusCount ?? "?"} items (${c.censusRequests ?? "?"} requests) · page file refs checked ${c.pageRefsChecked ?? 0}`);
       for (const p of c.problems) lines.push(`PROBLEM [${p.check}] ${p.text}`);
@@ -4146,7 +4232,7 @@
     try {
       lastVerifyReport = await verifyLibraryCoverage((text) => { if (button) button.textContent = text; });
     } catch (error) {
-      console.error("[BB Plus verify]", error);
+      console.error("[B+ verify]", error);
       // A crashed audit must never look like a clean one.
       lastVerifyReport = [{ courseName: "Verify", problems: [{ check: "error", text: `The audit itself failed: ${error?.message || error}` }], notes: [] }];
     }
@@ -4336,7 +4422,7 @@
   function ingestReportText(summary) {
     const { succeeded = [], unresolved = [], failed = [], fetchFailed = [], courseFailures = [] } = summary || {};
     const lines = [
-      `BB Plus ${chrome.runtime.getManifest().version} sync report — ${new Date().toISOString()}`,
+      `B+ ${chrome.runtime.getManifest().version} sync report — ${new Date().toISOString()}`,
       `indexed=${succeeded.length} downloadFailed=${fetchFailed.length} readFailed=${failed.length} skipped=${unresolved.length} coursesUnscanned=${courseFailures.length}`,
       ""
     ];
@@ -4349,7 +4435,7 @@
   function reasonLabel(reason) {
     switch (reason) {
       case "no-download-url":
-        return "BB Plus hasn't found this file's download address in Blackboard's data (v2.7 couldn't either). Upload it manually for now.";
+        return "B+ hasn't found this file's download address in Blackboard's data (v2.7 couldn't either). Upload it manually for now.";
       case "unsupported-format":
         return "This file format isn't supported for local parsing yet.";
       case "missing-vendor-library:pdfjs":
@@ -4363,7 +4449,7 @@
       case "external-link":
         return "This is a link to an external site, not a course file — nothing to index.";
       case "assessment":
-        return "This is a quiz, test, or assignment — BB Plus doesn't index interactive assessments yet.";
+        return "This is a quiz, test, or assignment — B+ doesn't index interactive assessments yet.";
       case "empty-page":
         return "Blackboard page with no text of its own — its attached files are indexed separately.";
       case "media-file":
@@ -4373,7 +4459,7 @@
       case "no-content-extracted":
         return "The file downloaded, but no text or images could be extracted from it.";
       case "outline-scan-incomplete":
-        return "BB Plus couldn't read this course's file listing at all this run — none of its files were even attempted.";
+        return "B+ couldn't read this course's file listing at all this run — none of its files were even attempted.";
       case "not-in-library":
         return "Not in the library, and not synced yet in this page session — run Build study library to see why.";
       case "reported-ok-but-not-in-library":
@@ -4394,7 +4480,7 @@
           return `Download failed (${reason.slice("fetch-failed:".length).trim()}).`;
         }
         if (String(reason || "").startsWith("unhandled-item-type:")) {
-          return `Blackboard returned a content type BB Plus doesn't recognize yet (${reason.slice("unhandled-item-type:".length)}).`;
+          return `Blackboard returned a content type B+ doesn't recognize yet (${reason.slice("unhandled-item-type:".length)}).`;
         }
         return reason || "Could not process this file.";
     }
@@ -4633,7 +4719,7 @@
 
       // Full detail in the console too, so a run can be diagnosed from one paste.
       const problemRows = [...courseFailures, ...fetchFailed, ...failed, ...unresolved];
-      console.groupCollapsed(`[BB Plus ingest] ${succeeded.length} indexed, ${fetchFailed.length} download failures, ${failed.length} read failures, ${unresolved.length} skipped`);
+      console.groupCollapsed(`[B+ ingest] ${succeeded.length} indexed, ${fetchFailed.length} download failures, ${failed.length} read failures, ${unresolved.length} skipped`);
       console.table(problemRows.map((r) => ({ course: r.courseName, title: r.title, stage: r.stage || "skipped", reason: r.reason })));
       console.groupEnd();
 
@@ -4642,7 +4728,7 @@
         setTimeout(() => { button.textContent = originalText; button.disabled = false; }, 2200);
       }
     } catch (error) {
-      console.error("[BB Plus ingest]", error);
+      console.error("[B+ ingest]", error);
       if (button) {
         button.textContent = "Sync failed";
         button.disabled = false;
@@ -4660,23 +4746,875 @@
   }
 
   function makeStudentCourseButton(record) {
+    const key = exactCourseKey(record);
     const button = document.createElement("button");
     button.type = "button";
     button.className = "bbx-student-course";
-    button.textContent = record.displayName;
-    button.addEventListener("click", () => {
-      state.studentSelectedCourse = exactCourseKey(record);
-      state.selectedProbeCourse = exactCourseKey(record);
-      save();
 
-      const key = exactCourseKey(record);
-      if (!state.courseProbeResults.has(key)) {
-        probeCourseData(record, false, { fast: true });
-      } else {
+    const name = document.createElement("span");
+    name.className = "bbx-student-course-title";
+    name.textContent = record.displayName;
+
+    const statusLine = document.createElement("span");
+    statusLine.className = "bbx-student-course-status";
+    statusLine.dataset.bbxPrepCourse = key;
+    const status = activePreparationStatus.get(key);
+    statusLine.textContent = prepLabel(status);
+    statusLine.dataset.tone = prepPhaseTone(status);
+
+    button.append(name, statusLine);
+    button.addEventListener("click", () => {
+      state.studentSelectedCourse = key;
+      state.selectedProbeCourse = key;
+      save();
+      render();
+      // Selecting a class reprioritizes it in the background sweep and forces a
+      // fresh probe so its materials are current.
+      schedulePrepareAllCourses("select-course");
+      probeActiveCourse(record, true).catch((error) => {
+        diagEvent("active-course-probe-failed", { course: record.displayName, error: String(error?.message || error) });
+      });
+    });
+    return button;
+  }
+
+  function probeActiveCourse(record, force = false) {
+    const key = exactCourseKey(record);
+    if (state.courseProbeStatus.get(key) === "loading") return Promise.resolve(null);
+    if (force) {
+      state.courseProbeResults.delete(key);
+      state.courseOutlineCache.delete(key);
+      if (!activePreparation.has(key)) {
+        activePreparedDescriptors.delete(key);
+        activePreparationSignatures.delete(key);
+        activePreparationReadyIds.delete(key);
+        activePreparationFailedIds.delete(key);
+        setActivePreparationStatus(record, { phase: "discovering", total: 0, ready: 0, failed: 0 });
+      }
+    }
+    return probeCourseData(record, force, {
+      fast: true,
+      onDiscovery(partial) {
+        state.courseProbeResults.set(key, partial);
+        state.courseProbeStatus.set(key, "loading");
+        cacheProbeOutline(key, partial);
         render();
       }
     });
-    return button;
+  }
+
+  function courseCodeFor(record) {
+    const name = cleanText(record?.displayName);
+    const fromTitle = name.match(/^([A-Z]{2,8}\s*[- ]?\s*\d{2,5}[A-Z]?(?:[- ]\d{1,3})?)/i)?.[1];
+    return cleanText(firstText(fromTitle, record?.courseCode, name)).slice(0, 80);
+  }
+
+  async function extensionRequest(message) {
+    const response = await chrome.runtime.sendMessage(message);
+    if (!response?.ok) throw new Error(response?.error || "AI Lookup Chat could not complete that request.");
+    return response;
+  }
+
+  async function ensureCourseMapping(record) {
+    const key = exactCourseKey(record);
+    if (courseMappingCache.has(key)) return courseMappingCache.get(key);
+    if (courseMappingTasks.has(key)) return courseMappingTasks.get(key);
+    const task = (async () => {
+      const blackboardCourseId = firstText(record.id);
+      if (!blackboardCourseId) throw new Error("Blackboard did not provide a stable class ID.");
+      let apiState = await extensionRequest({ type: "BBX_CP_STATE" });
+      let mapping = (apiState.mappings || []).find((item) => item.blackboard_course_id === blackboardCourseId);
+      if (!mapping) {
+        const candidate = BBCourseWork.matchCourse({
+          ...record,
+          courseCode: courseCodeFor(record)
+        }, apiState.courses || []);
+        if (candidate) {
+          await extensionRequest({
+            type: "BBX_CP_SAVE_MAPPING", blackboardCourseId,
+            courseId: candidate.course_id, courseName: record.displayName
+          });
+        } else {
+          await extensionRequest({
+            type: "BBX_CP_CREATE_AND_MAP", blackboardCourseId,
+            code: courseCodeFor(record), title: cleanText(record.displayName),
+            term: cleanText(record.termName)
+          });
+        }
+        apiState = await extensionRequest({ type: "BBX_CP_STATE" });
+        mapping = (apiState.mappings || []).find((item) => item.blackboard_course_id === blackboardCourseId);
+      }
+      if (!mapping) throw new Error("AI Lookup Chat could not save the Blackboard class link.");
+      const linked = { apiState, mapping };
+      courseMappingCache.set(key, linked);
+      return linked;
+    })();
+    courseMappingTasks.set(key, task);
+    try { return await task; }
+    finally { courseMappingTasks.delete(key); }
+  }
+
+  function setActivePreparationStatus(record, next) {
+    const key = exactCourseKey(record);
+    const status = { ...(activePreparationStatus.get(key) || {}), ...next };
+    activePreparationStatus.set(key, status);
+    const label = prepLabel(status);
+    for (const node of document.querySelectorAll("[data-bbx-material-course]")) {
+      if (node.dataset.bbxMaterialCourse === key) {
+        node.textContent = label;
+        node.dataset.tone = prepPhaseTone(status);
+      }
+    }
+    for (const node of document.querySelectorAll("[data-bbx-retry-course]")) {
+      if (node.dataset.bbxRetryCourse === key) node.hidden = !["failed", "partial"].includes(status.phase);
+    }
+    refreshPrepIndicators();
+  }
+
+  async function waitForCourseCopilotJob(jobId, record, readyIds, failedIds) {
+    if (!jobId) throw new Error("AI Lookup Chat did not return an indexing job ID.");
+    for (let attempt = 0; attempt < 900; attempt++) {
+      const job = await extensionRequest({ type: "BBX_CP_JOB", jobId });
+      for (const item of job.files || []) {
+        const id = item.item_id || item.itemId;
+        if (!id) continue;
+        if (item.status === "ok" || item.status === "reused") {
+          readyIds.add(id);
+          failedIds.delete(id);
+        } else if (item.status === "failed" || item.status === "unsupported") {
+          failedIds.add(id);
+        }
+      }
+      setActivePreparationStatus(record, {
+        phase: "running", ready: readyIds.size,
+        failed: failedIds.size
+      });
+        if (job.status === "done" || job.status === "failed") {
+        for (const item of job.files || []) {
+          const id = item.item_id || item.itemId;
+          if (id && !["ok", "reused"].includes(item.status)) failedIds.add(id);
+        }
+        if (job.status === "failed") throw new Error("AI Lookup Chat could not finish one material batch.");
+        return;
+      }
+      // Poll fast at first (most batches finish in well under a second once the
+      // embedding model is warm), then back off so a long job stays cheap.
+      await new Promise((resolve) => setTimeout(resolve, Math.min(300 + attempt * 150, 1500)));
+    }
+    throw new Error("AI Lookup Chat is still preparing this class. Reopen the class to check progress.");
+  }
+
+  function activeOutlineSignature(record, outline) {
+    return buildCourseIngestJobs(record, outline || [])
+      .filter((item) => item.kind === "fetch" || item.kind === "markup" ||
+        (item.kind === "unresolved" && item.reason === "no-download-url" && item.parentId))
+      .map((item) => `${item.itemId}:${item.kind}:${item.url || ""}`)
+      .sort().join("|");
+  }
+
+  async function startActiveCoursePreparation(record, outline, { retry = false, partial = false } = {}) {
+    const key = exactCourseKey(record);
+    const signature = activeOutlineSignature(record, outline);
+    const current = retry ? null : activePreparationStatus.get(key);
+    if (activePreparation.has(key)) {
+      if (signature && (signature !== activePreparationSignatures.get(key) ||
+          (!partial && activePreparationIsPartial.get(key)))) {
+        queuedActivePreparations.set(key, { outline, partial, signature });
+      }
+      return activePreparation.get(key);
+    }
+    if (!retry && ["complete", "partial", "failed"].includes(current?.phase) &&
+        signature === activePreparationSignatures.get(key)) return null;
+
+    let processed = activePreparedDescriptors.get(key);
+    if (!processed || retry) {
+      processed = new Set();
+      activePreparedDescriptors.set(key, processed);
+    }
+    let readyIds = activePreparationReadyIds.get(key);
+    let failedIds = activePreparationFailedIds.get(key);
+    if (!readyIds || retry) {
+      readyIds = new Set();
+      activePreparationReadyIds.set(key, readyIds);
+    }
+    if (!failedIds || retry) {
+      failedIds = new Set();
+      activePreparationFailedIds.set(key, failedIds);
+    }
+    activePreparationSignatures.set(key, signature);
+    activePreparationIsPartial.set(key, partial);
+
+    const task = (async () => {
+      const courseId = firstText(record.id);
+      setActivePreparationStatus(record, {
+        phase: "discovering", total: current?.total || 0,
+        ready: readyIds.size, failed: failedIds.size, message: ""
+      });
+      try {
+        const descriptors = buildCourseIngestJobs(record, outline || []);
+        const descriptorKey = (item) => `${item.itemId}::${item.url || item.kind}`;
+        const queryPriority = (item) => BBCourseWork.queryRelevance(
+          activePreparationQueries.get(key) || "",
+          [item.title, item.name, item.filename, item.courseName].filter(Boolean).join(" ")
+        );
+        const direct = descriptors.filter((item) =>
+          (item.kind === "fetch" || item.kind === "markup") && !processed.has(descriptorKey(item))
+        );
+        const unresolvedFiles = descriptors.filter((item) =>
+          item.kind === "unresolved" && item.reason === "no-download-url" && item.parentId &&
+          !processed.has(descriptorKey(item))
+        );
+        const total = Math.max(current?.total || 0, readyIds.size + failedIds.size) + direct.length + unresolvedFiles.length;
+        setActivePreparationStatus(record, {
+          phase: "running", total, ready: readyIds.size, failed: failedIds.size
+        });
+
+        async function processBatch(batch) {
+          if (!batch.length) return;
+          for (const item of batch) processed.add(descriptorKey(item));
+
+          // PDF materials go to the backend's PyMuPDF+OCR extractor (far
+          // stronger than the in-browser parser, and it OCRs scans/handwriting).
+          // Downloaded in parallel, then uploaded in size-bounded batches so the
+          // backend embeds a whole batch in one pass. Any file that fails this
+          // path falls through to the parser below — this only adds coverage.
+          const serverHandled = new Set();
+          const pdfCandidates = batch.filter((item) => item.kind === "fetch" && _looksPdf(item));
+          if (pdfCandidates.length) {
+            const uploads = [];
+            await BBCourseWork.mapLimit(pdfCandidates, 3, async (item) => {
+              try {
+                const u8 = (await BBStage.fetchRaw(item)).u8;
+                const isPdf = u8.length > 4 && u8[0] === 0x25 && u8[1] === 0x50 && u8[2] === 0x44 && u8[3] === 0x46;
+                if (!isPdf || u8.length > 40 * 1024 * 1024) return; // leave for the parser path
+                uploads.push({ item, base64: BBStage.toBase64(u8) });
+              } catch (error) {
+                diagEvent("server-extract-fetch-failed", {
+                  course: record.displayName, item: item.title, error: String(error?.message || error),
+                });
+              }
+            });
+
+            // Group under a ~24 MB base64 budget per request (chrome messaging).
+            const groups = [];
+            let group = [], size = 0;
+            for (const up of uploads) {
+              if (group.length && size + up.base64.length > 24 * 1024 * 1024) {
+                groups.push(group); group = []; size = 0;
+              }
+              group.push(up); size += up.base64.length;
+            }
+            if (group.length) groups.push(group);
+
+            for (const g of groups) {
+              try {
+                const reply = await extensionRequest({
+                  type: "BBX_CP_INGEST_FILES", blackboardCourseId: courseId,
+                  files: g.map(({ item, base64 }) => ({
+                    item_id: item.itemId, title: item.title || item.itemId,
+                    filename: `${item.title || item.itemId}.pdf`, content_base64: base64,
+                  })),
+                });
+                const skippedIds = new Set((reply.skipped || []).map((s) => s.item_id));
+                for (const id of skippedIds) failedIds.add(id);
+                if (reply.job_id) await waitForCourseCopilotJob(reply.job_id, record, readyIds, failedIds);
+                for (const { item } of g) {
+                  if (!skippedIds.has(item.itemId)) serverHandled.add(descriptorKey(item));
+                }
+              } catch (error) {
+                diagEvent("server-extract-fallback", {
+                  course: record.displayName, error: String(error?.message || error),
+                });
+                // Whole group failed -> those items fall through to the parser.
+              }
+            }
+          }
+
+          const fetchJobs = batch.filter((item) => item.kind === "fetch" && !serverHandled.has(descriptorKey(item)));
+          const stagedResults = await BBCourseWork.mapLimit(fetchJobs, 3, async (item) => {
+            try {
+              const staged = await BBStage.fetchAndStage(item);
+              return {
+                ok: true,
+                job: {
+                  kind: "staged", itemId: item.itemId, courseId: item.courseId,
+                  courseName: item.courseName, title: item.title,
+                  sourceType: item.sourceType, pageUrl: item.pageUrl || "",
+                  mimeType: item.mimeType || staged.mimeType || "",
+                  stageKey: staged.stageKey, chunks: staged.chunks,
+                  byteLength: staged.byteLength
+                }
+              };
+            } catch (error) {
+              return { ok: false, item, reason: error?.message || String(error) };
+            }
+          });
+
+          const ingestJobs = batch.filter((item) => item.kind === "markup").map((item) => ({
+            kind: "markup", itemId: item.itemId, courseId: item.courseId,
+            courseName: item.courseName, title: item.title,
+            sourceType: "html", markup: item.markup, pageUrl: ""
+          }));
+          for (const result of stagedResults) {
+            if (result.ok) ingestJobs.push(result.job);
+            else failedIds.add(result.item.itemId);
+          }
+
+          let parsed = [];
+          if (ingestJobs.length) {
+            try {
+              const response = await extensionRequest({ type: "BBX_INGEST_JOBS", jobs: ingestJobs });
+              parsed = response.results || [];
+              for (const item of response.skipped || []) failedIds.add(item.item_id);
+            } catch (error) {
+              for (const item of ingestJobs) failedIds.add(item.itemId);
+              diagEvent("active-course-parse-batch-failed", { course: record.displayName, error: String(error?.message || error) });
+            }
+          }
+          for (const item of parsed) if (!item.ok) failedIds.add(item.itemId);
+          setActivePreparationStatus(record, { phase: "running", ready: readyIds.size, failed: failedIds.size });
+
+          const ids = [...new Set(parsed.filter((item) => item.ok).map((item) => item.itemId))];
+          if (!ids.length) return;
+          try {
+            const sync = await extensionRequest({
+              type: "BBX_CP_SYNC_COURSE", blackboardCourseId: courseId, itemIds: ids
+            });
+            for (const item of sync.skipped || []) failedIds.add(item.item_id);
+            if (sync.job_id) await waitForCourseCopilotJob(sync.job_id, record, readyIds, failedIds);
+          } catch (error) {
+            for (const id of ids) {
+              readyIds.delete(id);
+              failedIds.add(id);
+            }
+            diagEvent("active-course-sync-batch-failed", { course: record.displayName, error: String(error?.message || error) });
+          }
+        }
+
+        // Prefer Blackboard pages and smaller, already-resolved materials so
+        // the first answer can be grounded while file downloads continue.
+        const BATCH_SIZE = 4;
+        const directQueue = direct.slice();
+        while (directQueue.length) {
+          directQueue.sort((a, b) => queryPriority(b) - queryPriority(a) ||
+            Number(a.kind !== "markup") - Number(b.kind !== "markup"));
+          await processBatch(directQueue.splice(0, BATCH_SIZE));
+        }
+
+        if (unresolvedFiles.length) {
+          const folders = new Map();
+          for (const item of unresolvedFiles) {
+            const folderKey = `${item.courseId}::${item.parentId}`;
+            if (!folders.has(folderKey)) folders.set(folderKey, []);
+            folders.get(folderKey).push(item);
+          }
+          const folderResults = await BBCourseWork.mapLimit([...folders.entries()], 3, async ([folderKey, items]) => {
+            const [folderCourseId, parentId] = folderKey.split("::");
+            try {
+              const found = await BBStage.resolvePermanentUrls(location.origin, folderCourseId, parentId);
+              for (const item of items) {
+                const hit = found.get(item.itemId);
+                if (hit) {
+                  item.kind = "fetch";
+                  item.url = hit.url;
+                  item.mimeType = item.mimeType || hit.mimeType;
+                }
+              }
+              return items.filter((item) => item.kind === "fetch");
+            } catch (_) { return []; }
+          });
+          const resolved = folderResults.flat();
+          const resolvedIds = new Set(resolved.map((item) => item.itemId));
+          for (const item of unresolvedFiles) if (!resolvedIds.has(item.itemId)) failedIds.add(item.itemId);
+          const resolvedQueue = resolved.slice();
+          while (resolvedQueue.length) {
+            resolvedQueue.sort((a, b) => queryPriority(b) - queryPriority(a));
+            await processBatch(resolvedQueue.splice(0, BATCH_SIZE));
+          }
+        }
+
+        // A later completeness pass finds page bodies that the public course
+        // tree did not expose. It runs after the first materials are searchable.
+        if (!partial) {
+          try {
+            const roots = BBAudit.censusRoots(flattenCourseOutline(outline || []));
+            if (roots.length) {
+              const census = await BBStage.censusCourse(location.origin, courseId, roots);
+              const extras = BBAudit.censusTextJobs(census.items, descriptors, visibleTextOf);
+              const unseen = extras.filter((item) => !readyIds.has(item.itemId) && !failedIds.has(item.itemId));
+              if (unseen.length) {
+                setActivePreparationStatus(record, { phase: "running", total: total + unseen.length, ready: readyIds.size, failed: failedIds.size });
+                const extraJobs = unseen.map((item) => ({
+                  itemId: item.itemId, courseId, courseName: cleanText(record.displayName) || courseId,
+                  title: item.title, kind: "markup", sourceType: "html", markup: item.markup
+                }));
+                for (let index = 0; index < extraJobs.length; index += BATCH_SIZE) {
+                  await processBatch(extraJobs.slice(index, index + BATCH_SIZE));
+                }
+              }
+            }
+          } catch (error) {
+            diagEvent("active-course-completeness-pass-failed", { course: record.displayName, error: String(error?.message || error) });
+          }
+        }
+
+        setActivePreparationStatus(record, {
+          phase: partial ? "discovering" : failedIds.size ? "partial" : "complete",
+          total: Math.max(total, readyIds.size + failedIds.size),
+          ready: readyIds.size, failed: failedIds.size
+        });
+      } catch (error) {
+        setActivePreparationStatus(record, {
+          phase: "failed", message: error?.message || String(error),
+          total: 0, ready: readyIds.size, failed: failedIds.size
+        });
+      }
+    })();
+    activePreparation.set(key, task);
+    try { await task; }
+    finally {
+      activePreparation.delete(key);
+      activePreparationIsPartial.delete(key);
+      const queued = queuedActivePreparations.get(key);
+      queuedActivePreparations.delete(key);
+      if (queued && (queued.signature !== signature || queued.partial !== partial)) {
+        startActiveCoursePreparation(record, queued.outline, { partial: queued.partial });
+      }
+    }
+    return null;
+  }
+
+  // --- Authoritative auto-preparation lifecycle -------------------------
+  //
+  // One owner for: discover every current course → map it to a AI Lookup Chat
+  // course (creating one if needed) → discover its materials → sync them →
+  // compile the study library. Runs automatically once Blackboard has exposed
+  // the course list, for ALL current courses, with the active/visible course
+  // prioritized so it is usable first while the rest compile in the background.
+  //
+  // Idempotent by construction: ensureCourseMapping caches + de-dupes per
+  // course, probeCourseData guards on a per-course "loading" flag and reuses
+  // cached outlines, and startActiveCoursePreparation skips a course whose
+  // material signature is unchanged. The sweep can therefore be triggered
+  // liberally (page load, SPA navigation, new courses appearing) without
+  // duplicating work.
+
+  function activeCourseKey() {
+    return state.studentSelectedCourse || state.selectedProbeCourse || "";
+  }
+
+  function schedulePrepareAllCourses(reason = "") {
+    if (prepareSweepScheduled) return;
+    prepareSweepScheduled = true;
+    // Coalesce bursts of discovery events into a single sweep.
+    setTimeout(() => {
+      prepareSweepScheduled = false;
+      prepareAllCourses(reason).catch((error) =>
+        diagEvent("prepare-sweep-failed", { reason, error: String(error?.message || error) }));
+    }, 0);
+  }
+
+  async function prepareAllCourses(reason = "") {
+    if (prepareSweepRunning) { prepareSweepRerun = true; return; }
+    prepareSweepRunning = true;
+    try {
+      do {
+        prepareSweepRerun = false;
+        const records = studentCourseRecords();
+        if (!records.length) return;
+        const activeKey = activeCourseKey();
+        const active = records.find((record) => exactCourseKey(record) === activeKey);
+        const rest = records.filter((record) => record !== active);
+        refreshPrepIndicators();
+        // The active course gets its own lane for a head start; the remaining
+        // courses compile two at a time so the sidebar stays responsive and we
+        // never burst too many requests at Blackboard or the local backend.
+        const lanes = [];
+        if (active) lanes.push(prepareOneCourse(active, reason));
+        lanes.push(BBCourseWork.mapLimit(rest, 2, (record) => prepareOneCourse(record, reason)));
+        await Promise.all(lanes);
+      } while (prepareSweepRerun);
+    } finally {
+      prepareSweepRunning = false;
+      refreshPrepIndicators();
+    }
+  }
+
+  async function prepareOneCourse(record, reason = "") {
+    const key = exactCourseKey(record);
+    if (!key) return;
+    try {
+      // Auto create/link/persist the Blackboard→AI Lookup Chat mapping.
+      await ensureCourseMapping(record);
+    } catch (error) {
+      diagEvent("prepare-course-mapping-failed", { course: record.displayName, reason, error: String(error?.message || error) });
+      return;
+    }
+    let probe = state.courseProbeResults.get(key);
+    if (!probe || !Array.isArray(probe.outline)) {
+      try { probe = await probeCourseData(record, false, { silent: true, fast: true }); }
+      catch (error) { diagEvent("prepare-course-probe-failed", { course: record.displayName, reason, error: String(error?.message || error) }); }
+    }
+    const outline = probe?.outline || state.courseProbeResults.get(key)?.outline || [];
+    refreshPrepIndicators();
+    if (outline.length) {
+      await startActiveCoursePreparation(record, outline, { partial: probe?.partial === true });
+    } else {
+      // A course with no discoverable materials is "ready" (nothing to compile)
+      // rather than stuck compiling forever.
+      const status = activePreparationStatus.get(key);
+      if (!status || status.phase === "discovering") {
+        setActivePreparationStatus(record, { phase: "complete", total: 0, ready: 0, failed: 0 });
+      }
+    }
+    refreshPrepIndicators();
+  }
+
+  // Consumer-facing preparation copy. Deliberately hides every technical
+  // detail (chunks, embeddings, OCR, parsers, course/db ids, model names):
+  // the student only needs to know whether a class is ready.
+  function prepLabel(status) {
+    const phase = status?.phase;
+    if (!phase || phase === "discovering") return "Compiling files…";
+    if (phase === "running") {
+      const total = status.total || 0;
+      const done = Math.min(status.ready || 0, total || (status.ready || 0));
+      return total ? `Compiling files… ${done} / ${total}` : "Compiling files…";
+    }
+    if (phase === "complete") return "Ready to go";
+    if (phase === "partial") {
+      return status.failed ? `Ready — ${status.failed} file${status.failed === 1 ? "" : "s"} couldn’t be prepared` : "Ready to go";
+    }
+    if (phase === "failed") return "Couldn’t finish preparing your course";
+    return "Compiling files…";
+  }
+
+  function prepPhaseTone(status) {
+    const phase = status?.phase;
+    if (phase === "complete") return "ready";
+    if (phase === "partial") return status.failed ? "attention" : "ready";
+    if (phase === "failed") return "failed";
+    return "compiling";
+  }
+
+  // Push the current preparation state into the live UI without a full
+  // re-render: the per-class status lines, the class-list rows, and the global
+  // "Preparing your courses…" banner.
+  function refreshPrepIndicators() {
+    for (const node of document.querySelectorAll("[data-bbx-prep-course]")) {
+      const key = node.dataset.bbxPrepCourse;
+      const status = activePreparationStatus.get(key);
+      node.textContent = prepLabel(status);
+      node.dataset.tone = prepPhaseTone(status);
+    }
+    const banner = document.getElementById("bbx-prep-banner");
+    if (banner) {
+      const records = studentCourseRecords();
+      // Statuses live in memory, so every fresh load legitimately begins with
+      // "Preparing your courses…" and clears once every class is ready.
+      const anyBusy = records.length > 0 && records.some((record) => {
+        const phase = activePreparationStatus.get(exactCourseKey(record))?.phase;
+        return !phase || phase === "discovering" || phase === "running";
+      });
+      banner.textContent = anyBusy ? "Preparing your courses…" : "";
+      banner.hidden = !anyBusy;
+    }
+  }
+
+  // Minimal, safe Markdown → DOM. Every piece of model text is written with
+  // textContent and only http(s) links become anchors, so nothing the model
+  // returns is ever interpreted as HTML. Covers what AI Lookup Chat answers
+  // actually use: headings, bold/italic, inline code, fenced code, ordered and
+  // unordered lists, blockquotes, links and paragraphs.
+  // Light-weight math prettifier: no full TeX engine (the sidebar can't ship
+  // one), but it strips \( \) / \[ \] delimiters and turns the common textbook
+  // forms — subscripts, superscripts, and a handful of operators/Greek — into
+  // real Unicode, so "\( p_{1}x_{1} \le m \)" reads as "p₁x₁ ≤ m" instead of raw
+  // TeX. Anything it can't map is shown plainly rather than as backslash noise.
+  const _SUB = { "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄", "5": "₅", "6": "₆",
+    "7": "₇", "8": "₈", "9": "₉", "+": "₊", "-": "₋", "=": "₌", "(": "₍", ")": "₎",
+    a: "ₐ", e: "ₑ", i: "ᵢ", j: "ⱼ", o: "ₒ", x: "ₓ", n: "ₙ", t: "ₜ" };
+  const _SUP = { "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶",
+    "7": "⁷", "8": "⁸", "9": "⁹", "+": "⁺", "-": "⁻", "=": "⁼", "(": "⁽", ")": "⁾", n: "ⁿ", i: "ⁱ" };
+  const _MATH_SYM = { "\\le": "≤", "\\leq": "≤", "\\ge": "≥", "\\geq": "≥", "\\ne": "≠",
+    "\\neq": "≠", "\\times": "×", "\\cdot": "·", "\\div": "÷", "\\pm": "±", "\\to": "→",
+    "\\Rightarrow": "⇒", "\\rightarrow": "→", "\\leftarrow": "←", "\\approx": "≈",
+    "\\sum": "∑", "\\int": "∫", "\\infty": "∞", "\\partial": "∂", "\\nabla": "∇",
+    "\\alpha": "α", "\\beta": "β", "\\gamma": "γ", "\\delta": "δ", "\\epsilon": "ε",
+    "\\theta": "θ", "\\lambda": "λ", "\\mu": "μ", "\\pi": "π", "\\rho": "ρ",
+    "\\sigma": "σ", "\\tau": "τ", "\\phi": "φ", "\\omega": "ω", "\\Delta": "Δ",
+    "\\Sigma": "Σ", "\\Omega": "Ω", "\\geqslant": "≥", "\\leqslant": "≤" };
+
+  function _mapScript(body, table) {
+    let out = "";
+    for (const ch of body) {
+      if (!(ch in table)) return null;
+      out += table[ch];
+    }
+    return out;
+  }
+
+  function formatMath(raw) {
+    let s = String(raw || "");
+    s = s.replace(/\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, "($1)/($2)");
+    // Subscripts/superscripts, braced or single-char.
+    s = s.replace(/([_^])\{([^{}]*)\}|([_^])([A-Za-z0-9])/g, (m, b1, body, b2, ch) => {
+      const kind = b1 || b2;
+      const text = body != null ? body : ch;
+      const mapped = _mapScript(text, kind === "_" ? _SUB : _SUP);
+      return mapped != null ? mapped : (kind === "_" ? `_${text}` : `^${text}`);
+    });
+    for (const [cmd, sym] of Object.entries(_MATH_SYM)) s = s.split(cmd).join(sym);
+    s = s.replace(/\\left|\\right|\\,|\\;|\\!|\\quad|\\qquad/g, " ");
+    s = s.replace(/\\[A-Za-z]+/g, (c) => c.slice(1)); // drop unknown commands, keep the word
+    s = s.replace(/[{}]/g, "");
+    return s.replace(/\s{2,}/g, " ").trim();
+  }
+
+  // Real math typesetting via KaTeX → MathML, which Chrome renders natively
+  // (no CSS/fonts needed). Falls back to the Unicode approximation if KaTeX
+  // isn't loaded or the expression won't parse.
+  function renderTex(tex, display) {
+    const span = document.createElement("span");
+    span.className = "bbx-math";
+    const katex = self.katex;
+    if (katex) {
+      try {
+        span.innerHTML = katex.renderToString(tex, {
+          output: "mathml", throwOnError: false, displayMode: !!display,
+        });
+        return span;
+      } catch (_) { /* fall back below */ }
+    }
+    span.textContent = formatMath(tex);
+    return span;
+  }
+
+  function renderInlineMarkdown(parent, text, ctx) {
+    // <n> is a citation sentinel injected by the citation context
+    // (see makeCitationContext); it renders as a numbered, clickable reference.
+    const re = /(\d+)|(\\\([^\n]*?\\\)|\\\[[^\n]*?\\\])|(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*\n]+\*|_[^_\n]+_)|(\[[^\]]+\]\([^)\s]+\))/g;
+    let last = 0;
+    let match;
+    while ((match = re.exec(text))) {
+      if (match.index > last) parent.append(text.slice(last, match.index));
+      const token = match[0];
+      if (token.charCodeAt(0) === 0xe000) {
+        const n = Number(token.slice(1, -1));
+        parent.append(ctx ? ctx.renderMarker(n) : document.createTextNode(`[${n}]`));
+      } else if (token.startsWith("\\(") || token.startsWith("\\[")) {
+        parent.append(renderTex(token.slice(2, -2), token.startsWith("\\[")));
+      } else if (token.startsWith("`")) {
+        const code = document.createElement("code");
+        code.textContent = token.slice(1, -1);
+        parent.append(code);
+      } else if (token.startsWith("**")) {
+        const strong = document.createElement("strong");
+        strong.textContent = token.slice(2, -2);
+        parent.append(strong);
+      } else if (token.startsWith("[")) {
+        const parts = /^\[([^\]]+)\]\(([^)\s]+)\)$/.exec(token);
+        if (parts && /^https?:\/\//i.test(parts[2])) {
+          const link = document.createElement("a");
+          link.href = parts[2];
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.textContent = parts[1];
+          parent.append(link);
+        } else {
+          parent.append(parts ? parts[1] : token);
+        }
+      } else {
+        const em = document.createElement("em");
+        em.textContent = token.replace(/^[*_]|[*_]$/g, "");
+        parent.append(em);
+      }
+      last = match.index + token.length;
+    }
+    if (last < text.length) parent.append(text.slice(last));
+  }
+
+  function renderMarkdownInto(container, markdown, ctx) {
+    const lines = String(markdown || "").replace(/\r\n?/g, "\n").split("\n");
+    let i = 0;
+    const isBreak = (line) => !line.trim() || /^```/.test(line) || /^#{1,6}\s/.test(line) ||
+      /^>\s?/.test(line) || /^\s*[-*+]\s+/.test(line) || /^\s*\d+\.\s+/.test(line);
+
+    while (i < lines.length) {
+      const line = lines[i];
+      if (!line.trim()) { i++; continue; }
+
+      const fence = line.match(/^```/);
+      if (fence) {
+        const buffer = [];
+        i++;
+        while (i < lines.length && !/^```/.test(lines[i])) { buffer.push(lines[i]); i++; }
+        i++; // closing fence
+        const pre = document.createElement("pre");
+        const code = document.createElement("code");
+        code.textContent = buffer.join("\n");
+        pre.append(code);
+        container.append(pre);
+        continue;
+      }
+
+      const heading = line.match(/^(#{1,6})\s+(.*)$/);
+      if (heading) {
+        // Keep headings within the small panel's type scale.
+        const level = Math.min(6, heading[1].length + 2);
+        const node = document.createElement("h" + level);
+        renderInlineMarkdown(node, heading[2].trim(), ctx);
+        container.append(node);
+        i++;
+        continue;
+      }
+
+      if (/^>\s?/.test(line)) {
+        const buffer = [];
+        while (i < lines.length && /^>\s?/.test(lines[i])) { buffer.push(lines[i].replace(/^>\s?/, "")); i++; }
+        const quote = document.createElement("blockquote");
+        renderInlineMarkdown(quote, buffer.join(" "), ctx);
+        container.append(quote);
+        continue;
+      }
+
+      const ordered = /^\s*\d+\.\s+/.test(line);
+      if (ordered || /^\s*[-*+]\s+/.test(line)) {
+        const pattern = ordered ? /^\s*\d+\.\s+/ : /^\s*[-*+]\s+/;
+        const list = document.createElement(ordered ? "ol" : "ul");
+        while (i < lines.length && pattern.test(lines[i])) {
+          const item = document.createElement("li");
+          renderInlineMarkdown(item, lines[i].replace(pattern, ""), ctx);
+          list.append(item);
+          i++;
+        }
+        container.append(list);
+        continue;
+      }
+
+      const buffer = [line];
+      i++;
+      while (i < lines.length && !isBreak(lines[i])) { buffer.push(lines[i]); i++; }
+      const paragraph = document.createElement("p");
+      renderInlineMarkdown(paragraph, buffer.join(" "), ctx);
+      container.append(paragraph);
+    }
+  }
+
+  // --- Blackboard-linked, numbered citations ----------------------------
+  //
+  // A grounded answer arrives with in-text labels like "[econ304_bbx_ab…, p. 1]"
+  // (the internal AI Lookup Chat course id) and a citations list. Neither is
+  // useful to a student. We map each cited source back to the actual Blackboard
+  // content page — matching on the item id the material was ingested under, and
+  // falling back to its title — then rewrite the labels as compact, clickable,
+  // Wikipedia-style numbers ([1], [2], …) that open the file in Blackboard.
+
+  async function _sha256Hex(text) {
+    const bytes = new TextEncoder().encode(String(text));
+    const digest = await crypto.subtle.digest("SHA-256", bytes);
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  function _normTitle(value) {
+    return cleanText(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  }
+
+  // {byItemHash: Map(hash16 -> {url,title}), byTitle: Map(normTitle -> {url,title})}.
+  // hash16 mirrors the backend's source id: sha256(itemId)[:16] (see
+  // api/integrations/bbplus.py safe_material_filename + ingest _source_id).
+  async function buildBlackboardSourceMap(courseKey) {
+    const map = { byItemHash: new Map(), byTitle: new Map() };
+    const probe = state.courseProbeResults.get(courseKey) || state.courseOutlineCache.get(courseKey);
+    const outline = probe?.outline;
+    if (!Array.isArray(outline) || !outline.length) return map;
+    const leaves = [];
+    walkOutlineLeaves(outline, (item) => leaves.push(item));
+    for (const item of leaves) {
+      const url = absUrl(firstText(item.url, item.downloadUrl));
+      if (!url) continue;
+      const title = cleanText(firstText(item.title));
+      const entry = { url, title };
+      try {
+        const hash = await _sha256Hex(stableItemId(item));
+        map.byItemHash.set(hash.slice(0, 16), entry);
+      } catch (_) {}
+      if (title) map.byTitle.set(_normTitle(title), entry);
+    }
+    return map;
+  }
+
+  function blackboardEntryForCitation(citation, sourceTitle, bbMap) {
+    const hashMatch = String(citation.source_id || "").match(/bbplus_([0-9a-f]{16})/i);
+    if (hashMatch && bbMap.byItemHash.has(hashMatch[1].toLowerCase())) {
+      return bbMap.byItemHash.get(hashMatch[1].toLowerCase());
+    }
+    const title = _normTitle(sourceTitle || citation.chapter_title || "");
+    if (title && bbMap.byTitle.has(title)) return bbMap.byTitle.get(title);
+    return null;
+  }
+
+  // The backend already numbers citations by source: answer.citations[i] is the
+  // source cited in text as [i+1]. Resolve each to its Blackboard page and make
+  // the in-text [n] markers clickable superscript links.
+  function makeCitationContext(citations, target, bbMap, blackboardCourseId) {
+    const sourceTitleOf = (c) =>
+      target?.sources?.find((s) => s.source_id === c.source_id)?.title || "";
+
+    const urlOf = (c) => {
+      const entry = blackboardEntryForCitation(c, sourceTitleOf(c), bbMap);
+      if (entry?.url) return { url: entry.url, where: "Blackboard" };
+      // Fall back to the locally-served copy if the Blackboard page is unknown.
+      if (c.source_id) {
+        return {
+          url: `${COURSE_COPILOT_ORIGIN}/api/integrations/bbplus/course-mappings/` +
+            `${encodeURIComponent(blackboardCourseId)}/sources/${encodeURIComponent(c.source_id)}/file`,
+          where: "stored copy",
+        };
+      }
+      return { url: "", where: "" };
+    };
+
+    const refs = citations.map((c, i) => {
+      const link = urlOf(c);
+      return {
+        n: i + 1, source_id: c.source_id,
+        title: sourceTitleOf(c) || c.chapter_title || c.source_id || "Course material",
+        url: link.url, where: link.where,
+      };
+    });
+    const max = refs.length;
+
+    return {
+      // Rewrite a text's labels into numbering sentinels. Returns the new text.
+      tokenize(text) {
+        if (!max || !text) return text || "";
+        return text.replace(/\[(\d+)\]/g, (m, digits) => {
+          const n = Number(digits);
+          if (n < 1 || n > max) return m;
+          return `${n}`;
+        });
+      },
+      // A [n] superscript link to the source (opens in Blackboard).
+      renderMarker(n) {
+        const ref = refs[n - 1];
+        const sup = document.createElement("sup");
+        sup.className = "bbx-cite";
+        if (ref?.url) {
+          const a = document.createElement("a");
+          a.href = ref.url;
+          a.target = "_blank";
+          a.rel = "noopener noreferrer";
+          a.textContent = `[${n}]`;
+          if (ref.title) a.title = ref.title;
+          sup.append(a);
+        } else {
+          sup.textContent = `[${n}]`;
+        }
+        return sup;
+      },
+      refs,
+    };
   }
 
   function makeCourseCopilotPanel(record) {
@@ -4686,23 +5624,21 @@
 
     const heading = document.createElement("h3");
     heading.id = "bbx-copilot-title";
-    heading.textContent = "Course Copilot";
+    heading.textContent = "AI Lookup Chat";
     const intro = document.createElement("p");
     intro.className = "bbx-copilot-intro";
-    intro.textContent = "Sync this course’s BB Plus library, then ask questions grounded in its materials.";
+    intro.textContent = "Ask questions about this class and its Blackboard materials.";
     const status = document.createElement("div");
     status.className = "bbx-copilot-status";
     status.setAttribute("role", "status");
     status.setAttribute("aria-live", "polite");
-    const setup = document.createElement("div");
-    setup.className = "bbx-copilot-setup";
     const actions = document.createElement("div");
     actions.className = "bbx-copilot-actions";
     const askArea = document.createElement("div");
     askArea.className = "bbx-copilot-ask";
     const resultArea = document.createElement("div");
     resultArea.className = "bbx-copilot-result";
-    section.append(heading, intro, status, setup, actions, askArea, resultArea);
+    section.append(heading, intro, status, actions, askArea, resultArea);
 
     const blackboardCourseId = firstText(record.id);
     const courseName = cleanText(record.displayName) || blackboardCourseId;
@@ -4720,13 +5656,14 @@
     };
     const send = async (type, fields = {}) => {
       const reply = await chrome.runtime.sendMessage({ type, ...fields });
-      if (!reply?.ok) throw new Error(reply?.error || "Course Copilot could not complete that request.");
+      if (!reply?.ok) throw new Error(reply?.error || "AI Lookup Chat could not complete that request.");
       return reply;
     };
 
     let apiState = null;
     let mappedCourse = null;
     let refreshing = false;
+    const courseKey = exactCourseKey(record);
 
     const renderMappedTools = () => {
       actions.replaceChildren();
@@ -4734,29 +5671,6 @@
       if (!mappedCourse) return;
 
       const target = apiState?.courses?.find((course) => course.course_id === mappedCourse.course_id);
-      const mappedLabel = document.createElement("div");
-      mappedLabel.className = "bbx-copilot-mapped";
-      mappedLabel.textContent = `Course Copilot course: ${target ? `${target.code} — ${target.title}` : mappedCourse.course_id}`;
-      actions.append(mappedLabel);
-
-      const syncButton = button("Sync BB Plus library", "bbx-copilot-primary", async (event) => {
-        const control = event.currentTarget;
-        control.disabled = true;
-        setStatus("Sending BB Plus materials to Course Copilot…", "loading");
-        try {
-          const library = await send("BBX_LIBRARY_STATUS", { courseId: blackboardCourseId });
-          const readyCount = (library.items || []).filter((item) => item.contentful).length;
-          if (!readyCount) throw new Error("No readable materials are saved in BB Plus yet. Use Build study library first.");
-          const sync = await send("BBX_CP_SYNC_COURSE", { blackboardCourseId });
-          setStatus(`Submitted ${sync.files?.length || readyCount} materials. Course Copilot is indexing them…`, "loading");
-          await pollJob(sync.job_id, 0);
-        } catch (error) {
-          setStatus(error?.message || String(error), "error");
-        } finally {
-          control.disabled = false;
-        }
-      });
-      actions.append(syncButton);
 
       const form = document.createElement("form");
       form.className = "bbx-copilot-form";
@@ -4778,7 +5692,7 @@
       const submit = document.createElement("button");
       submit.type = "submit";
       submit.className = "bbx-copilot-primary";
-      submit.textContent = "Ask Course Copilot";
+      submit.textContent = "Ask";
       options.append(depthLabel, submit);
       form.append(questionLabel, options);
       askArea.append(form);
@@ -4791,6 +5705,7 @@
           question.focus();
           return;
         }
+        activePreparationQueries.set(courseKey, prompt);
         submit.disabled = true;
         resultArea.replaceChildren();
         setStatus("Searching this course’s materials and preparing an answer…", "loading");
@@ -4798,10 +5713,10 @@
           const answer = await send("BBX_CP_ASK", {
             blackboardCourseId, question: prompt, depth: depth.value
           });
-          renderAnswer(answer, target);
+          await renderAnswer(answer, target);
           setStatus(answer.refused
             ? "The indexed course materials did not contain enough evidence to answer."
-            : `Answered from ${answer.backend || "Course Copilot"}.`, answer.refused ? "warning" : "success");
+            : `Answered from ${answer.backend || "AI Lookup Chat"}.`, answer.refused ? "warning" : "success");
         } catch (error) {
           setStatus(error?.message || String(error), "error");
         } finally {
@@ -4810,142 +5725,85 @@
       });
     };
 
-    const renderAnswer = (answer, target) => {
+    const renderAnswer = async (answer, target) => {
       resultArea.replaceChildren();
+
+      const citations = Array.isArray(answer.citations) ? answer.citations : [];
+      // Resolve each cited source to its Blackboard page, then set up numbered,
+      // clickable references shared across the answer and explanation.
+      const bbMap = citations.length
+        ? await buildBlackboardSourceMap(courseKey).catch(() => ({ byItemHash: new Map(), byTitle: new Map() }))
+        : { byItemHash: new Map(), byTitle: new Map() };
+      const ctx = citations.length
+        ? makeCitationContext(citations, target, bbMap, blackboardCourseId)
+        : null;
+
       const answerCard = document.createElement("article");
       answerCard.className = "bbx-copilot-card";
       const answerHeading = document.createElement("h4");
       answerHeading.textContent = "Answer";
       const answerText = document.createElement("div");
-      answerText.className = "bbx-copilot-answer-text";
-      answerText.textContent = answer.answer || "No answer was returned.";
+      answerText.className = "bbx-copilot-answer-text bbx-md";
+      const answerBody = ctx ? ctx.tokenize(answer.answer || "") : (answer.answer || "No answer was returned.");
+      renderMarkdownInto(answerText, answerBody || "No answer was returned.", ctx);
       answerCard.append(answerHeading, answerText);
       if (answer.explanation) {
         const explanationHeading = document.createElement("h4");
         explanationHeading.textContent = "Explanation";
         const explanation = document.createElement("div");
-        explanation.className = "bbx-copilot-answer-text";
-        explanation.textContent = answer.explanation;
+        explanation.className = "bbx-copilot-answer-text bbx-md";
+        renderMarkdownInto(explanation, ctx ? ctx.tokenize(answer.explanation) : answer.explanation, ctx);
         answerCard.append(explanationHeading, explanation);
       }
       resultArea.append(answerCard);
 
-      const citations = Array.isArray(answer.citations) ? answer.citations : [];
-      if (!citations.length) return;
-      const sourceList = document.createElement("div");
+      if (!ctx || !ctx.refs.length) return;
+
+      const sourceList = document.createElement("ol");
       sourceList.className = "bbx-copilot-sources";
       const sourceHeading = document.createElement("h4");
-      sourceHeading.textContent = "Sources used";
-      sourceList.append(sourceHeading);
-      for (const citation of citations) {
-        const item = document.createElement("div");
+      sourceHeading.className = "bbx-copilot-sources-title";
+      sourceHeading.textContent = "Sources";
+      resultArea.append(sourceHeading, sourceList);
+      for (const ref of ctx.refs) {
+        const item = document.createElement("li");
         item.className = "bbx-copilot-source";
-        const source = target?.sources?.find((entry) => entry.source_id === citation.source_id);
-        const name = document.createElement("strong");
-        name.textContent = source?.title || citation.source_id || "Course material";
-        const location = document.createElement("span");
-        const chapter = citation.chapter_title || (citation.chapter_num ? `Chapter ${citation.chapter_num}` : "");
-        const pages = citation.page_start ? (citation.page_end && citation.page_end !== citation.page_start
-          ? `pp. ${citation.page_start}–${citation.page_end}` : `p. ${citation.page_start}`) : "";
-        location.textContent = [chapter, pages].filter(Boolean).join(" · ");
+        item.value = ref.n;
+        const name = document.createElement(ref.url ? "a" : "strong");
+        name.textContent = ref.title;
+        if (ref.url) {
+          name.className = "bbx-copilot-source-link";
+          name.href = ref.url;
+          name.target = "_blank";
+          name.rel = "noopener noreferrer";
+          if (ref.where && ref.where !== "Blackboard") name.title = `Opens the ${ref.where}`;
+        }
         item.append(name);
-        if (location.textContent) item.append(location);
         sourceList.append(item);
       }
-      resultArea.append(sourceList);
-    };
-
-    const pollJob = async (jobId, attempt) => {
-      if (!jobId) throw new Error("Course Copilot did not return an indexing job ID.");
-      const job = await send("BBX_CP_JOB", { jobId });
-      const details = (job.files || []).map((file) => {
-        const progress = file.pages_total ? ` ${file.pages_done || 0}/${file.pages_total}` : "";
-        return `${file.filename}: ${file.stage || job.status}${progress}${file.detail ? ` — ${file.detail}` : ""}`;
-      }).slice(0, 4).join(" · ");
-      if (job.status === "done") {
-        setStatus(details ? `Indexed. ${details}` : "Materials indexed and ready for questions.", "success");
-        try {
-          apiState = await send("BBX_CP_STATE");
-          mappedCourse = (apiState.mappings || []).find((item) => item.blackboard_course_id === blackboardCourseId) || mappedCourse;
-          renderMappedTools();
-        } catch (_) {}
-        return;
-      }
-      if (job.status === "failed") {
-        setStatus(details || "Course Copilot could not finish indexing these materials. Retry the sync.", "error");
-        return;
-      }
-      setStatus(details || "Course Copilot is indexing the materials…", "loading");
-      if (attempt >= 180) {
-        setStatus("Indexing is taking longer than expected. The job continues in Course Copilot; retry this status check shortly.", "warning");
-        return;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-      return pollJob(jobId, attempt + 1);
     };
 
     const refresh = async () => {
       if (refreshing) return;
       refreshing = true;
-      setup.replaceChildren();
       actions.replaceChildren();
       askArea.replaceChildren();
-      setStatus("Connecting to Course Copilot…", "loading");
+      setStatus("Connecting to AI Lookup Chat…", "loading");
       try {
-        apiState = await send("BBX_CP_STATE");
-        mappedCourse = (apiState.mappings || []).find((item) => item.blackboard_course_id === blackboardCourseId) || null;
-        const selectorLabel = document.createElement("label");
-        selectorLabel.textContent = mappedCourse ? "Mapped Course Copilot course" : "Choose a Course Copilot course";
-        const selector = document.createElement("select");
-        selector.add(new Option("Select a course…", ""));
-        for (const course of apiState.courses || []) {
-          selector.add(new Option(`${course.code} — ${course.title}${course.term ? ` (${course.term})` : ""}`, course.course_id));
-        }
-        if (mappedCourse) selector.value = mappedCourse.course_id;
-        selectorLabel.append(selector);
-        const mapButton = button(mappedCourse ? "Save course mapping" : "Map course", "bbx-copilot-secondary", async (event) => {
-          if (!selector.value) {
-            setStatus("Choose a Course Copilot course first.", "error");
-            return;
-          }
-          event.currentTarget.disabled = true;
-          try {
-            await send("BBX_CP_SAVE_MAPPING", {
-              blackboardCourseId, courseId: selector.value, courseName
-            });
-            setStatus("Course mapping saved.", "success");
-            await refresh();
-          } catch (error) {
-            setStatus(error?.message || String(error), "error");
-            event.currentTarget.disabled = false;
-          }
-        });
-        const createButton = button("Create and map this course", "bbx-copilot-secondary", async (event) => {
-          if (!blackboardCourseId) {
-            setStatus("Blackboard did not provide a stable course ID, so this course cannot be mapped safely.", "error");
-            return;
-          }
-          event.currentTarget.disabled = true;
-          try {
-            await send("BBX_CP_CREATE_AND_MAP", {
-              blackboardCourseId,
-              code: record.courseCode || courseName.slice(0, 80),
-              title: courseName,
-              term: record.termName || ""
-            });
-            setStatus("Course created and mapped.", "success");
-            await refresh();
-          } catch (error) {
-            setStatus(error?.message || String(error), "error");
-            event.currentTarget.disabled = false;
-          }
-        });
-        setup.append(selectorLabel, mapButton, createButton);
+        const linked = await ensureCourseMapping(record);
+        apiState = linked.apiState;
+        mappedCourse = linked.mapping;
         renderMappedTools();
-        setStatus(mappedCourse ? "Course mapping is ready." : "Map this Blackboard course before syncing or asking questions.");
+        setStatus("This class is connected to AI Lookup Chat.", "success");
+        const probe = state.courseProbeResults.get(courseKey);
+        if (probe?.outline) {
+          startActiveCoursePreparation(record, probe.outline, { partial: probe.partial === true });
+          const prep = activePreparationStatus.get(courseKey);
+          if (prep?.phase === "failed") setStatus(prep.message || "Materials could not be prepared. Retry when ready.", "error");
+        }
       } catch (error) {
-        setStatus(`${error?.message || error} Use the BB Plus extension menu to connect Course Copilot, then retry.`, "error");
-        setup.append(button("Retry connection", "bbx-copilot-secondary", () => refresh()));
+        setStatus(`${error?.message || error} Use the B+ extension menu to connect AI Lookup Chat, then retry.`, "error");
+        actions.append(button("Retry connection", "bbx-copilot-secondary", () => refresh()));
       } finally {
         refreshing = false;
       }
@@ -4982,16 +5840,42 @@
     const status = state.courseProbeStatus.get(key) || "";
     const probe = state.courseProbeResults.get(key);
 
-    if (!probe) {
-      const loading = document.createElement("div");
-      loading.className = "bbx-student-empty";
-      loading.textContent = status === "loading"
-        ? "Loading course content…"
-        : "Course content has not been loaded yet.";
-      container.append(loading);
+    const materialSummary = document.createElement("section");
+    materialSummary.className = "bbx-student-materials";
+    const materialHeading = document.createElement("strong");
+    materialHeading.textContent = "Course materials";
+    const count = document.createElement("span");
+    count.className = "bbx-student-material-count";
+    const materialStatus = document.createElement("span");
+    materialStatus.className = "bbx-student-material-status";
+    materialStatus.dataset.bbxMaterialCourse = key;
+    if (probe?.outline) {
+      const jobs = buildCourseIngestJobs(record, probe.outline);
+      const processable = jobs.filter((item) =>
+        item.kind === "fetch" || item.kind === "markup" ||
+        (item.kind === "unresolved" && item.reason === "no-download-url" && item.parentId)
+      );
+      count.textContent = `${processable.length} ${processable.length === 1 ? "material" : "materials"}`;
+    } else {
+      count.textContent = status === "loading" ? "Finding materials…" : "Materials are not loaded yet";
+    }
+    materialStatus.dataset.tone = prepPhaseTone(activePreparationStatus.get(key));
+    materialStatus.textContent = prepLabel(activePreparationStatus.get(key));
+    const retryMaterials = document.createElement("button");
+    retryMaterials.type = "button";
+    retryMaterials.className = "bbx-copilot-secondary bbx-student-material-retry";
+    retryMaterials.textContent = "Retry materials";
+    retryMaterials.dataset.bbxRetryCourse = key;
+    retryMaterials.hidden = !["failed", "partial"].includes(activePreparationStatus.get(key)?.phase);
+    retryMaterials.addEventListener("click", () => {
+      startActiveCoursePreparation(record, state.courseProbeResults.get(key)?.outline || [], { retry: true });
+    });
+    materialSummary.append(materialHeading, count, materialStatus, retryMaterials);
+    container.append(materialSummary);
 
+    if (!probe) {
       if (status !== "loading") {
-        setTimeout(() => probeCourseData(record, false, { fast: true }), 0);
+        setTimeout(() => probeActiveCourse(record, false), 0);
       }
       return;
     }
@@ -5003,15 +5887,6 @@
       container.append(empty);
       return;
     }
-
-    const outline = document.createElement("div");
-    outline.className = "bbx-student-outline";
-
-    for (const item of probe.outline) {
-      outline.append(renderOutlineItem(item, 0));
-    }
-
-    container.append(outline);
   }
 
   function renderStudent() {
@@ -5035,6 +5910,14 @@
     if (selected) {
       renderStudentCourseDetail(panel, selected);
     } else {
+      const prepBanner = document.createElement("div");
+      prepBanner.id = "bbx-prep-banner";
+      prepBanner.className = "bbx-prep-banner";
+      prepBanner.setAttribute("role", "status");
+      prepBanner.setAttribute("aria-live", "polite");
+      prepBanner.hidden = true;
+      panel.append(prepBanner);
+
       const list = document.createElement("div");
       list.className = "bbx-student-course-list";
 
@@ -5053,6 +5936,7 @@
     }
 
     body.replaceChildren(panel);
+    refreshPrepIndicators();
   }
 
   function renderDiagnostic() {
@@ -5113,16 +5997,18 @@
 
   function render() {
     try {
+      const tools = document.getElementById("bbx-header-tools");
+      if (tools) tools.hidden = state.uiMode !== "debug";
       if (state.uiMode === "debug") renderDiagnostic();
       else renderStudent();
     } catch (error) {
-      console.error("[BB Plus render]", error);
+      console.error("[B+ render]", error);
       const body = document.getElementById("bbx-body");
       if (body) {
         const pre = document.createElement("pre");
         pre.className = "bbx-render-crash";
         pre.textContent =
-          "Study Hub render error:\n" +
+          "B+ render error:\n" +
           String(error?.stack || error?.message || error) +
           "\n\nRaw network data:\n" +
           prettyJson(state.diagnostics?.network || []);
@@ -5138,7 +6024,12 @@
       ensureUi();
       scanDom();
       setTimeout(() => refreshCourseListFromKnownEndpoints(), 250);
-      setTimeout(() => scheduleCoursePreload(600), 600);
+      // Once Blackboard exposes the course list (from its normal course-list
+      // traffic), the automatic lifecycle discovers, maps, syncs and compiles
+      // every current course — active course first — in the background. The
+      // sweep is idempotent, so triggering it here and again on navigation or
+      // as new course traffic arrives never duplicates work.
+      schedulePrepareAllCourses("startup");
 
       const observer = new MutationObserver(scheduleScan);
       observer.observe(document.documentElement, { childList: true, subtree: true });

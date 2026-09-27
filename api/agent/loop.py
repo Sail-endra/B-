@@ -30,6 +30,11 @@ from .tools import ToolBox, ToolResult, tool_schemas
 
 NOT_IN_MATERIALS = "NOT_IN_MATERIALS"
 
+# The sidebar synthesis retrieves a wider reranked pool than the strict lookup so
+# more distinct files reach the model; it still cites only what it uses.
+_PRODUCT_TOP_K = 18
+_PRODUCT_MAX_SOURCES = 8
+
 SYSTEM_PROMPT = f"""You are a study assistant that answers strictly from the student's own course materials.
 
 Rules, in priority order:
@@ -145,6 +150,220 @@ class Agent:
             explanation=explanation,
             depth=depth,
             explained=explained,
+            backend=backend,
+        )
+
+    # -- product path -------------------------------------------------------
+
+    async def answer_product(self, question: str, course: Optional[str] = None,
+                             depth: str = "concise", numbered: bool = False) -> AgentAnswer:
+        """Product answering: grounded when the materials answer the question,
+        general-knowledge fallback (clearly labelled) when they do not, and a
+        real overview for meta questions.
+
+        `numbered` selects the sidebar's clean single-pass synthesis (one AI
+        answer, `[n]` citations by source); the default path preserves the web
+        app's extractive-answer + explanation with bracket-label citations.
+
+        This exists ONLY for the product endpoints. The benchmark keeps calling
+        `ask`/`ask_async`, whose strict grounding the eval harness measures, so
+        nothing here can move those numbers.
+        """
+        from . import product_answer as pa
+
+        started = time.monotonic()
+        prefs = self.store.get_prefs(self.user_id)
+        llm = self._llm if self._llm is not None else resolve_product_llm(prefs)
+        course_row = self.store.course(self.user_id, course) if course else None
+        course_code = (course_row.code if course_row else "") or (course or "")
+
+        # 1. Overview / "what do I need to know" — synthesise from the course's
+        #    real structure, which no single passage lookup answers well.
+        if course and llm.available and pa.is_overview_question(question):
+            topics, assessments = self._course_structure(course)
+            text = pa.overview_answer(question, course_code, topics, assessments, depth, llm)
+            if text:
+                return self._product_answer(question, text, depth, started,
+                                            backend=f"{getattr(llm, 'label', 'model')} · course overview")
+
+        # The sidebar synthesis casts a wider net than the strict lookup: a
+        # larger reranked pool means a relevant file (e.g. a terse slide deck)
+        # is not crowded out of the top-6 by one dense reading, and the AI then
+        # cites only what it actually uses. The benchmark keeps the default k.
+        result = self.pipeline.search(
+            question, course_id=course, top_k=(_PRODUCT_TOP_K if numbered else None))
+
+        # 2a. Sidebar path: one clean AI synthesis over numbered sources. The AI
+        #     itself decides grounded-vs-general and cites only what it uses, so
+        #     there is no raw extractive noise and no false "not in materials".
+        if numbered and llm.available:
+            return self._synthesized_answer(question, course, course_code, depth,
+                                            result, llm, started)
+
+        # 2b. Default (web) path: relevance judge, then grounded generation or a
+        #     labelled general fallback.
+        grounded = bool(result.chunks) and not result.refused
+        if grounded and llm.available and result.confidence < pa.RELEVANCE_JUDGE_CEILING:
+            passages = [{"snippet": s.chunk.text} for s in result.chunks]
+            if pa.judge_relevance(question, passages, llm) is False:
+                grounded = False
+
+        if grounded:
+            return await self.ask_async(question, course, depth=depth)
+
+        if llm.available:
+            text = pa.general_answer(question, course_code, depth, llm)
+            if text:
+                return self._product_answer(question, text, depth, started,
+                                            backend=f"{getattr(llm, 'label', 'model')} · beyond your materials")
+
+        # No model available: fall back to the honest grounded refusal.
+        return await self.ask_async(question, course, depth=depth)
+
+    def _synthesized_answer(self, question: str, course: Optional[str], course_code: str,
+                            depth: str, result: Any, llm: Any, started: float) -> AgentAnswer:
+        """One AI answer over a smartly-selected set of the course's files.
+
+        Two retrieval signals are combined so the right file is never missed:
+          * embedding+rerank retrieval, for passage-level relevance WITHIN files;
+          * an LLM file-router over the WHOLE catalogue, which picks files a human
+            would pick by title/type (the syllabus for a policy question, the
+            slide deck for a concept question) even when embeddings bury them.
+        Router picks lead; embedding-ranked files backfill. The AI then answers
+        and cites only what it uses, or defers to general knowledge.
+        """
+        from collections import defaultdict
+
+        from . import product_answer as pa
+
+        all_sources = self.store.sources(self.user_id, course) if course else []
+        title_by_id = {s.source_id: s.title for s in all_sources}
+        type_by_id = {s.source_id: s.type.value for s in all_sources}
+
+        # All of the course's chunks, grouped by file — so a router-picked file
+        # that embedding retrieval missed can still contribute real content.
+        chunks_by_source: dict[str, list] = defaultdict(list)
+        for chunk in self.pipeline._chunks:
+            if course is None or chunk.course_id == course:
+                chunks_by_source[chunk.source_id].append(chunk)
+
+        # Embedding-retrieved parent passages, per file, in rank order.
+        retrieved_order: list[str] = []
+        retrieved_chunks: dict[str, list] = defaultdict(list)
+        for sc in result.chunks:
+            sid = sc.chunk.source_id
+            if sid not in retrieved_chunks:
+                retrieved_order.append(sid)
+            retrieved_chunks[sid].append(sc.chunk)
+
+        # Router: let the model choose relevant files from the full catalogue.
+        catalog = []
+        for i, source in enumerate(all_sources, 1):
+            body = chunks_by_source.get(source.source_id) or []
+            synopsis = pa.clean_snippet(body[0].text if body else "", cap=200)
+            catalog.append({"n": i, "source_id": source.source_id,
+                            "title": source.title, "type": type_by_id.get(source.source_id, "file"),
+                            "synopsis": synopsis})
+        picks = pa.route_files(question, catalog, llm)
+        picked_ids = [catalog[n - 1]["source_id"] for n in picks]
+
+        # Router picks first, then embedding-ranked files as a safety net.
+        selected: list[str] = []
+        for sid in picked_ids + retrieved_order:
+            if sid and sid not in selected:
+                selected.append(sid)
+        selected = selected[:_PRODUCT_MAX_SOURCES]
+
+        rep_chunk: dict[str, Any] = {}
+        sources = []
+        for i, sid in enumerate(selected, 1):
+            pool = retrieved_chunks.get(sid) or chunks_by_source.get(sid, [])[:3]
+            if not pool:
+                continue
+            rep_chunk[sid] = pool[0]
+            hydrated = self.store.get_chunks([c.id for c in pool[:3]], with_parents=True)
+            parent_text = {c.id: c.parent_text for c in hydrated}
+            snippets: list[str] = []
+            for chunk in pool[:3]:
+                snippet = pa.clean_snippet(parent_text.get(chunk.id) or chunk.text)
+                if snippet and snippet not in snippets:
+                    snippets.append(snippet)
+            sources.append({
+                "n": len(sources) + 1, "source_id": sid,
+                "title": title_by_id.get(sid) or pool[0].chapter_title or sid,
+                "course": pool[0].course_id, "snippets": snippets,
+            })
+
+        raw = pa.synthesize(question, sources, course_code, depth, llm)
+        if not raw:
+            return self._product_answer(
+                question,
+                f"{NOT_IN_MATERIALS} Course Copilot could not produce an answer just now.",
+                depth, started, backend=getattr(llm, "label", "model"), refused=True)
+
+        text, cited_ids = pa.finalize_citations(raw, [s["source_id"] for s in sources])
+        citations = [rep_chunk[sid].citation() for sid in cited_ids if sid in rep_chunk]
+        grounded = bool(citations)
+        label = getattr(llm, "label", "model") + (
+            " · from your materials" if grounded else " · general knowledge")
+        latency_ms = int((time.monotonic() - started) * 1000)
+        self._log(question, course, BudgetTracker(), False, latency_ms, citations)
+        self._record_engagement(citations)
+        return AgentAnswer(
+            question=question, answer=text, citations=citations, steps=[],
+            refused=False, latency_ms=latency_ms, explanation="", depth=depth,
+            explained=True, backend=label)
+
+    def _course_structure(self, course: str) -> tuple[list[str], list[str]]:
+        """The course's topics (chapter titles + schedule topics) and graded work,
+        used to ground an overview answer."""
+        topics: list[str] = []
+        seen: set[str] = set()
+
+        def add(value: str) -> None:
+            value = (value or "").strip()
+            key = value.lower()
+            if value and key not in seen:
+                seen.add(key)
+                topics.append(value)
+
+        for title in self.pipeline.chapter_titles.get(course, {}).values():
+            add(title)
+        try:
+            for row in self.store.schedule(self.user_id):
+                if row.get("course_id") == course:
+                    add(row.get("topic") or row.get("link_title") or "")
+        except Exception:  # noqa: BLE001 - structure is best-effort context
+            pass
+
+        assessments: list[str] = []
+        try:
+            for a in self.store.assessments(self.user_id, course):
+                label = a.title or getattr(a.kind, "label", "")
+                due = f" (due {a.due_date.isoformat()})" if a.due_date else ""
+                if label:
+                    assessments.append(f"{label}{due}")
+        except Exception:  # noqa: BLE001
+            pass
+        return topics, assessments
+
+    def _product_answer(self, question: str, text: str, depth: str, started: float,
+                        backend: str, refused: bool = False) -> AgentAnswer:
+        """Wrap a generated product answer (overview or fallback) with no
+        citations, and log the run."""
+        latency_ms = int((time.monotonic() - started) * 1000)
+        self._log(question, None, BudgetTracker(), refused, latency_ms, [])
+        return AgentAnswer(
+            question=question,
+            answer=text,
+            citations=[],
+            steps=[],
+            refused=refused,
+            latency_ms=latency_ms,
+            truncated=False,
+            explanation="",
+            depth=depth,
+            explained=not refused,
             backend=backend,
         )
 

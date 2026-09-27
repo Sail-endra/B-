@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +70,7 @@ class FileReport:
     pages: int = 0
     chapters: int = 0
     ocr_pages: int = 0
+    timings_ms: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -80,6 +82,7 @@ class FileReport:
             "pages": self.pages,
             "chapters": self.chapters,
             "ocr_pages": self.ocr_pages,
+            "timings_ms": self.timings_ms,
         }
 
 
@@ -162,7 +165,12 @@ def _guess_type(filename: str) -> SourceType:
     return SourceType.READINGS
 
 
-def _fit_embedder(store: SQLiteStore, user_id: str, new_texts: Sequence[str]) -> Embedder:
+def _fit_embedder(
+    store: SQLiteStore,
+    user_id: str,
+    new_texts: Sequence[str],
+    embedder: Optional[Embedder] = None,
+) -> Embedder:
     """Fit the embedder on this user's corpus, if it is a stateful one.
 
     A stateful (TF-IDF+SVD) embedder is corpus-fitted, so adding a source
@@ -171,7 +179,7 @@ def _fit_embedder(store: SQLiteStore, user_id: str, new_texts: Sequence[str]) ->
     fitting -- which is the whole reason for the switch: no per-user state file,
     and nothing to keep in sync, so the multi-tenancy bug class is gone.
     """
-    embedder = get_embedder()
+    embedder = embedder or get_embedder()
     if not embedder.stateful:
         return embedder
     existing = [c.embed_text for c in store.all_chunks(user_id)]
@@ -218,6 +226,7 @@ def ingest_files(
     store: Optional[SQLiteStore] = None,
     on_progress: ProgressFn = None,
     on_file_done: Optional[Callable[[], None]] = None,
+    file_titles: Optional[dict[str, str]] = None,
 ) -> IngestReport:
     store = store or get_store()
     report = IngestReport(course_id=course_id)
@@ -236,15 +245,13 @@ def ingest_files(
         course.title = title
     store.upsert_course(course)
 
-    embedder = get_embedder()
-    report.embedder = embedder.name
+    embedder: Optional[Embedder] = None
+    per_file: Optional[bool] = None
     # A stateless embedder (BGE, the product default) maps into a fixed space, so
     # each document can embed and persist independently -- which is what lets the
     # Ask tab enable per document as each finishes. A stateful (TF-IDF) embedder
     # must be fit on the whole corpus together, so those chunks are accumulated and
     # embedded in one pass at the end.
-    per_file = not embedder.stateful
-
     pending: list[Chunk] = []          # for the stateful batch path
     pending_parents: list[tuple] = []
     pending_chapter_rows: list[tuple] = []
@@ -254,7 +261,8 @@ def ingest_files(
         filename = path.name
         source_id = _source_id(course_id, filename)
         report_progress(i, stage="reading", pages_done=0, pages_total=0)
-        display_title = Path(filename).stem.replace("_", " ")[:80]
+        display_title = (file_titles or {}).get(filename, "").strip()[:300] \
+            or Path(filename).stem.replace("_", " ")[:80]
         if filename.lower().startswith("bbplus_") and path.suffix.lower() == ".md":
             try:
                 with path.open("r", encoding="utf-8") as imported:
@@ -270,41 +278,55 @@ def ingest_files(
         )
 
         # Cache: an identical re-upload to the same course is already ingested.
+        hash_started = time.perf_counter()
         try:
             file_hash = _sha256(path)
         except Exception:  # noqa: BLE001
             file_hash = ""
+        file_timings = {"hash_ms": round((time.perf_counter() - hash_started) * 1000)}
         source.file_hash = file_hash
         reusable_source_id = source_id if source.type is SourceType.BBPLUS else None
         if file_hash and store.source_with_hash(user_id, course_id, file_hash, reusable_source_id):
-            report.files.append(FileReport(filename, source_id, "ok",
-                                           detail="unchanged since last upload (reused)"))
+            report.files.append(FileReport(
+                filename, source_id, "ok", detail="unchanged since last upload (reused)",
+                timings_ms=file_timings,
+            ))
             report_progress(i, stage="reused", status="ok",
-                            detail="unchanged since last upload (reused)")
+                            detail="unchanged since last upload (reused)",
+                            timings_ms=file_timings)
             continue
 
         def page_cb(stage, done, total, _i=i):
             report_progress(_i, stage=stage, pages_done=done, pages_total=total)
 
+        extract_started = time.perf_counter()
         try:
             doc = extract(path, source_id, on_page=page_cb)
         except ExtractionError as exc:
+            file_timings["extract_ms"] = round((time.perf_counter() - extract_started) * 1000)
             detail = _user_message(exc, filename)
             source.status, source.status_detail = "unsupported", detail
             store.upsert_source(source)
-            report.files.append(FileReport(filename, source_id, "unsupported", detail))
-            report_progress(i, stage="failed", status="unsupported", detail=detail)
+            report.files.append(FileReport(filename, source_id, "unsupported", detail,
+                                           timings_ms=file_timings))
+            report_progress(i, stage="failed", status="unsupported", detail=detail,
+                            timings_ms=file_timings)
             continue
         except Exception as exc:  # noqa: BLE001
+            file_timings["extract_ms"] = round((time.perf_counter() - extract_started) * 1000)
             # Any reader failure is this file's problem, not the upload's. A
             # corrupt or truncated PDF previously raised out of here, returned a
             # bare HTTP 500, and took every other file in the same batch with it.
             detail = _user_message(exc, filename)
             source.status, source.status_detail = "failed", detail
             store.upsert_source(source)
-            report.files.append(FileReport(filename, source_id, "failed", detail))
-            report_progress(i, stage="failed", status="failed", detail=detail)
+            report.files.append(FileReport(filename, source_id, "failed", detail,
+                                           timings_ms=file_timings))
+            report_progress(i, stage="failed", status="failed", detail=detail,
+                            timings_ms=file_timings)
             continue
+        file_timings["extract_ms"] = round((time.perf_counter() - extract_started) * 1000)
+        file_timings["ocr_ms"] = round(getattr(doc, "ocr_seconds", 0.0) * 1000)
 
         source.pages = doc.page_count
         source.ocr_pages = doc.ocr_pages
@@ -315,31 +337,43 @@ def ingest_files(
             store.upsert_source(source)
             report.files.append(
                 FileReport(filename, source_id, "failed", source.status_detail,
-                           pages=doc.page_count, ocr_pages=doc.ocr_pages)
+                           pages=doc.page_count, ocr_pages=doc.ocr_pages,
+                           timings_ms=file_timings)
             )
             report_progress(i, stage="failed", status="failed",
-                            detail=source.status_detail)
+                            detail=source.status_detail, timings_ms=file_timings)
             continue
 
         report_progress(i, stage="chunking", pages_done=doc.page_count,
                         pages_total=doc.page_count)
+        chunk_started = time.perf_counter()
         result = chunk_document(
             doc, course_id=course_id, user_id=user_id,
             child_tokens=settings.retrieval.child_tokens,
             parent_tokens=settings.retrieval.parent_tokens,
             child_overlap=settings.retrieval.child_overlap,
         )
+        file_timings["chunk_ms"] = round((time.perf_counter() - chunk_started) * 1000)
+        db_started = time.perf_counter()
         store.upsert_source(source)
         store.clear_source(user_id, source_id)
+        file_timings["db_ms"] = round((time.perf_counter() - db_started) * 1000)
         chapter_rows = _chapter_rows_for(result, source_id, course_id)
         fr = FileReport(filename, source_id, "ok", chunks=len(result.chunks),
                         pages=doc.page_count, chapters=len(chapter_rows),
-                        ocr_pages=doc.ocr_pages)
+                        ocr_pages=doc.ocr_pages, timings_ms=file_timings)
         for warning in doc.warnings:
             if warning.startswith("OCR"):
                 fr.detail = warning
         report.files.append(fr)
         corpus_sample.extend(c.text for c in result.chunks[:: max(1, len(result.chunks) // 20)][:20])
+
+        if embedder is None:
+            model_started = time.perf_counter()
+            embedder = get_embedder()
+            fr.timings_ms["model_init_ms"] = round((time.perf_counter() - model_started) * 1000)
+            report.embedder = embedder.name
+            per_file = not embedder.stateful
 
         if per_file:
             # Embed in sub-batches so the dominant stage shows a real, moving bar
@@ -347,26 +381,37 @@ def ingest_files(
             texts = [c.embed_text for c in result.chunks]
             total_c = len(texts)
             batch = 128
+            embed_ms = 0
             report_progress(i, stage="embedding", pages_done=0, pages_total=total_c,
                             chunks=total_c)
             for s in range(0, total_c, batch):
+                embed_started = time.perf_counter()
                 vecs = embedder.embed(texts[s:s + batch])
+                embed_ms += round((time.perf_counter() - embed_started) * 1000)
                 for chunk, vector in zip(result.chunks[s:s + batch], vecs):
                     chunk.embedding = vector.tolist()
                 report_progress(i, stage="embedding",
                                 pages_done=min(s + batch, total_c),
                                 pages_total=total_c, chunks=total_c)
             report_progress(i, stage="indexing", chunks=len(result.chunks))
+            db_started = time.perf_counter()
             store.insert_parents(result.parents)
             store.insert_chunks(result.chunks)
+            fr.timings_ms["db_ms"] += round((time.perf_counter() - db_started) * 1000)
             if chapter_rows:
                 blobs = [r[6] for r in chapter_rows]
+                embed_started = time.perf_counter()
                 cvecs = embedder.embed(blobs)
+                embed_ms += round((time.perf_counter() - embed_started) * 1000)
+                db_started = time.perf_counter()
                 store.replace_chapters(user_id, source_id, [
                     (r[1], r[2], r[3], r[4], r[5], v) for r, v in zip(chapter_rows, cvecs)
                 ])
+                fr.timings_ms["db_ms"] += round((time.perf_counter() - db_started) * 1000)
+            fr.timings_ms["embed_ms"] = embed_ms
             report.total_chunks += len(result.chunks)
-            report_progress(i, stage="done", status="ok", chunks=len(result.chunks))
+            report_progress(i, stage="done", status="ok", chunks=len(result.chunks),
+                            detail=fr.detail, timings_ms=fr.timings_ms)
             # This document is now searchable; let the caller enable Ask for it.
             if on_file_done:
                 on_file_done()
@@ -377,7 +422,8 @@ def ingest_files(
 
     # Stateful embedder: one batch fit + embed over everything, then persist.
     if pending:
-        embedder = _fit_embedder(store, user_id, [c.embed_text for c in pending])
+        assert embedder is not None
+        embedder = _fit_embedder(store, user_id, [c.embed_text for c in pending], embedder)
         vectors = embedder.embed([c.embed_text for c in pending])
         for chunk, vector in zip(pending, vectors):
             chunk.embedding = vector.tolist()

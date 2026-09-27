@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import math
+import mimetypes
 import re
 import shutil
 import threading
@@ -76,9 +77,30 @@ async def reject_cross_site_mutations(request, call_next):
 WEB_DIR = ROOT / "web"
 UPLOAD_DIR = ROOT / "data" / "uploads"
 
+
+@app.on_event("startup")
+def _warm_embedder() -> None:
+    """Load the embedding model in the background at boot so the first course
+    compilation (and first question) doesn't pay the one-time ~7s cold start."""
+    if settings.offline:
+        return
+
+    def warm() -> None:
+        try:
+            from .embed import get_embedder
+            get_embedder().embed(["warm up"])
+            logger.info("Embedding model warmed.")
+        except Exception:  # noqa: BLE001 - warming is best-effort
+            logger.debug("Embedder warm-up skipped.", exc_info=True)
+
+    threading.Thread(target=warm, name="embed-warm", daemon=True).start()
+
 # One pipeline per user. Multi-tenant now, so a single global would leak one
 # user's corpus into another's answers.
 _pipelines: dict[str, RetrievalPipeline] = {}
+# One course-ingest worker at a time bounds CPU/RAM use and prevents several
+# simultaneous uploads from competing to load/encode with the shared BGE model.
+_material_ingest_semaphore = threading.BoundedSemaphore(1)
 
 
 def current_user() -> str:
@@ -187,6 +209,17 @@ class BBPlusDocument(BaseModel):
 
 class BBPlusSyncRequest(BaseModel):
     documents: list[BBPlusDocument] = Field(min_length=1, max_length=100)
+
+
+class BBPlusFileItem(BaseModel):
+    item_id: str = Field(min_length=1, max_length=300)
+    title: str = Field(default="Blackboard material", max_length=500)
+    filename: str = Field(default="", max_length=500)
+    content_base64: str = Field(min_length=1, max_length=90_000_000)
+
+
+class BBPlusFilesRequest(BaseModel):
+    files: list[BBPlusFileItem] = Field(min_length=1, max_length=12)
 
 
 class BBPlusAskRequest(BaseModel):
@@ -310,28 +343,124 @@ def sync_bbplus_materials(blackboard_course_id: str, request: BBPlusSyncRequest)
     if store.course(user, mapping["course_id"]) is None:
         raise HTTPException(409, detail={"code": "mapped_course_missing", "message": "The mapped Course Copilot course no longer exists. Choose a course again."})
 
-    prepared: list[tuple[str, str]] = []
+    prepared: list[tuple[str, str, str]] = []
+    skipped: list[dict[str, str]] = []
     total_chars = 0
-    try:
-        for document in request.documents:
-            if document.course_id and document.course_id != blackboard_course_id:
-                raise HTTPException(409, detail={"code": "course_mismatch", "message": "A document belongs to a different Blackboard course."})
+    # Validate every course identifier before writing any upload file. This is
+    # a hard isolation boundary; unreadable individual documents, however,
+    # should not discard other good documents in the same incremental batch.
+    if any(document.course_id and document.course_id != blackboard_course_id
+           for document in request.documents):
+        raise HTTPException(409, detail={"code": "course_mismatch", "message": "A document belongs to a different Blackboard course."})
+    for document in request.documents:
+        try:
             content = serialize_document(document.title, document.blocks)
+            if total_chars + len(content) > 24_000_000:
+                skipped.append({"item_id": document.item_id, "title": document.title,
+                                "reason": "This batch exceeds the 24 MB text limit."})
+                continue
             total_chars += len(content)
-            if total_chars > 24_000_000:
-                raise HTTPException(413, detail={"code": "sync_batch_too_large", "message": "Sync up to 24 MB of extracted text at a time."})
-            prepared.append((safe_material_filename(document.item_id, document.title), content))
-    except ValueError as exc:
-        raise HTTPException(422, detail={"code": "unreadable_material", "message": str(exc)}) from exc
+            prepared.append((safe_material_filename(document.item_id, document.title),
+                             content, document.item_id))
+        except ValueError as exc:
+            skipped.append({"item_id": document.item_id, "title": document.title,
+                            "reason": str(exc)[:200]})
+    if not prepared:
+        return {"course_id": mapping["course_id"], "job_id": "", "files": [],
+                "skipped": skipped}
 
     destination = UPLOAD_DIR / user / mapping["course_id"]
     destination.mkdir(parents=True, exist_ok=True)
     paths = []
-    for filename, content in prepared:
+    file_item_ids: dict[str, str] = {}
+    for filename, content, item_id in prepared:
         target = destination / filename
         target.write_text(content, encoding="utf-8")
         paths.append(target)
-    return _start_material_ingest(paths, mapping["course_id"], user, store)
+        file_item_ids[filename] = item_id
+    return {**_start_material_ingest(paths, mapping["course_id"], user, store,
+                                    file_item_ids=file_item_ids),
+            "skipped": skipped}
+
+
+@app.post("/api/integrations/bbplus/course-mappings/{blackboard_course_id}/materials/files")
+def ingest_bbplus_files(blackboard_course_id: str, request: BBPlusFilesRequest) -> dict[str, Any]:
+    """Ingest a batch of raw Blackboard files (PDF/DOCX) through the full
+    server-side extractor — PyMuPDF plus OCR for image-only/handwritten pages —
+    instead of the extension's text-layer-only parser. Batched into ONE ingest
+    job so the (one-at-a-time) embedder runs over all of them in one pass rather
+    than paying per-file overhead. Idempotent by content hash.
+    """
+    import base64
+    import binascii
+
+    user = _require_non_benchmark_product_user()
+    store = get_store()
+    mapping = store.bbplus_course_mapping(user, blackboard_course_id)
+    if mapping is None or store.course(user, mapping["course_id"]) is None:
+        raise HTTPException(409, detail={"code": "course_mapping_required",
+                                         "message": "Map this Blackboard course to a Course Copilot course first."})
+
+    destination = UPLOAD_DIR / user / mapping["course_id"]
+    destination.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    file_item_ids: dict[str, str] = {}
+    file_titles: dict[str, str] = {}
+    skipped: list[dict[str, str]] = []
+    for item in request.files:
+        ext = Path(item.filename or "").suffix.lower()
+        if ext not in {".pdf", ".docx"}:
+            skipped.append({"item_id": item.item_id, "reason": "not a PDF or DOCX"})
+            continue
+        try:
+            raw = base64.b64decode(item.content_base64, validate=True)
+        except (binascii.Error, ValueError):
+            skipped.append({"item_id": item.item_id, "reason": "invalid base64"})
+            continue
+        if not raw or len(raw) > 60_000_000:
+            skipped.append({"item_id": item.item_id, "reason": "empty or too large"})
+            continue
+        filename = safe_material_filename(item.item_id, item.title, ext)
+        (destination / filename).write_bytes(raw)
+        paths.append(destination / filename)
+        file_item_ids[filename] = item.item_id
+        file_titles[filename] = item.title
+
+    if not paths:
+        return {"course_id": mapping["course_id"], "job_id": "", "files": [], "skipped": skipped}
+    return {**_start_material_ingest(paths, mapping["course_id"], user, store,
+                                     file_item_ids=file_item_ids, file_titles=file_titles),
+            "skipped": skipped}
+
+
+@app.get("/api/integrations/bbplus/course-mappings/{blackboard_course_id}/sources/{source_id}/file")
+def bbplus_source_file(blackboard_course_id: str, source_id: str) -> FileResponse:
+    """Serve the stored file a citation came from, so the sidebar can link to it.
+
+    Scoped hard by user and by the Blackboard course's own mapping: a citation
+    can only ever open a source that belongs to the class it was answered from.
+    """
+    user = _require_non_benchmark_product_user()
+    store = get_store()
+    mapping = store.bbplus_course_mapping(user, blackboard_course_id)
+    if mapping is None:
+        raise HTTPException(404, detail={"code": "course_mapping_required",
+                                         "message": "This Blackboard class is not linked to Course Copilot."})
+    source = next((s for s in store.sources(user, mapping["course_id"])
+                   if s.source_id == source_id), None)
+    if source is None:
+        raise HTTPException(404, detail={"code": "source_not_found",
+                                         "message": "That cited material is no longer stored."})
+    path = Path(source.file)
+    if not path.is_file():
+        raise HTTPException(404, detail={"code": "file_missing",
+                                         "message": "The stored material file is missing."})
+    media_type = mimetypes.guess_type(path.name)[0] or "text/plain"
+    display_name = re.sub(r"[^A-Za-z0-9._-]+", "_", source.title or path.name).strip("_") or path.name
+    if not Path(display_name).suffix:
+        display_name += path.suffix
+    return FileResponse(str(path), media_type=media_type, filename=display_name,
+                        content_disposition_type="inline")
 
 
 @app.post("/api/integrations/bbplus/course-mappings/{blackboard_course_id}/ask")
@@ -345,7 +474,8 @@ async def ask_bbplus_course(blackboard_course_id: str, request: BBPlusAskRequest
     if not request.question.strip():
         raise HTTPException(400, detail={"code": "empty_question", "message": "Enter a question first."})
     agent = Agent(pipeline(), user_id=user)
-    answer = await agent.ask_async(request.question, mapping["course_id"], depth=request.depth)
+    answer = await agent.answer_product(request.question, mapping["course_id"],
+                                        depth=request.depth, numbered=True)
     return answer.to_dict()
 
 
@@ -359,7 +489,7 @@ async def ask(request: AskRequest) -> dict[str, Any]:
     if not request.question.strip():
         raise HTTPException(400, "question is required")
     agent = Agent(pipeline(), user_id=current_user())
-    answer = await agent.ask_async(request.question, request.course, depth=request.depth)
+    answer = await agent.answer_product(request.question, request.course, depth=request.depth)
     return answer.to_dict()
 
 
@@ -1243,12 +1373,17 @@ async def create_course(code: str = Form(...), title: str = Form("")) -> dict[st
     return {"course_id": course_id, "code": code, "title": title or code}
 
 
-def _start_material_ingest(paths: list[Path], course_id: str, user: str, store) -> dict[str, Any]:
+def _start_material_ingest(
+    paths: list[Path], course_id: str, user: str, store,
+    file_item_ids: Optional[dict[str, str]] = None,
+    file_titles: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
     """Create one ordinary Course Copilot ingest job for any trusted adapter."""
     course = store.course(user, course_id)
     job_id = uuid.uuid4().hex
     file_records = [
-        {"filename": p.name, "stage": "queued", "pages_done": 0, "pages_total": 0,
+        {"filename": p.name, "item_id": (file_item_ids or {}).get(p.name, ""),
+         "stage": "queued", "pages_done": 0, "pages_total": 0,
          "chunks": 0, "status": "", "detail": ""}
         for p in paths
     ]
@@ -1268,14 +1403,16 @@ def _start_material_ingest(paths: list[Path], course_id: str, user: str, store) 
             invalidate_pipeline(user)
 
         try:
-            store.update_job(job_id, status="running")
-            ingest_files(
-                paths, user_id=user, course_id=course_id,
-                code=course.code if course else course_id,
-                title=course.title if course else course_id,
-                store=store, on_progress=on_progress, on_file_done=on_file_done,
-            )
-            store.update_job(job_id, status="done")
+            with _material_ingest_semaphore:
+                store.update_job(job_id, status="running")
+                ingest_files(
+                    paths, user_id=user, course_id=course_id,
+                    code=course.code if course else course_id,
+                    title=course.title if course else course_id,
+                    store=store, on_progress=on_progress, on_file_done=on_file_done,
+                    file_titles=file_titles,
+                )
+                store.update_job(job_id, status="done")
         except Exception as exc:  # noqa: BLE001 - surface, never crash the server
             job = store.get_job(job_id, user) or {"files": file_records}
             logger.error("Material ingest job failed (%s).", type(exc).__name__)

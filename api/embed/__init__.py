@@ -13,9 +13,32 @@ installed. Selection is `COPILOT_EMBEDDER`: auto | bge | tfidf | openai.
 
 from __future__ import annotations
 
+import threading
+
 from .base import Embedder
 from .local_embed import LocalEmbedder
 from .openai_embed import OpenAIEmbedder
+
+
+_BGE_INSTANCES: dict[str, Embedder] = {}
+_BGE_LOCK = threading.Lock()
+
+
+def _bge_embedder(model_name: str) -> Embedder:
+    """Load one stateless BGE model per process and reuse it across ingest jobs."""
+    with _BGE_LOCK:
+        embedder = _BGE_INSTANCES.get(model_name)
+        if embedder is None:
+            from .bge_embed import BgeEmbedder
+            embedder = BgeEmbedder(model_name)
+            _BGE_INSTANCES[model_name] = embedder
+        return embedder
+
+
+def _clear_embedder_cache() -> None:
+    """Test hook; production callers should keep the process-level model warm."""
+    with _BGE_LOCK:
+        _BGE_INSTANCES.clear()
 
 
 def _bge_available() -> bool:
@@ -33,15 +56,13 @@ def get_embedder(force_local: bool = False) -> Embedder:
     if mode == "openai":
         return OpenAIEmbedder(settings.openai_api_key, settings.embed_model)
     if mode == "bge":
-        from .bge_embed import BgeEmbedder
-        return BgeEmbedder(settings.bge_model)
+        return _bge_embedder(settings.bge_model)
 
     # auto
     if settings.has_openai:
         return OpenAIEmbedder(settings.openai_api_key, settings.embed_model)
     if _bge_available():
-        from .bge_embed import BgeEmbedder
-        return BgeEmbedder(settings.bge_model)
+        return _bge_embedder(settings.bge_model)
     return LocalEmbedder()
 
 

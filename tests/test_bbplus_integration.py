@@ -54,6 +54,9 @@ def test_bbplus_ingests_chunks_retrieves_and_reuses_identical_upload(tmp_path, m
         )
 
         count_before = store.chunk_count_for_course("alice", "ECON303")
+        def unexpected_embedder_load():
+            raise AssertionError("unchanged sync should not initialize an embedding model")
+        monkeypatch.setattr("api.corpus.ingest_service.get_embedder", unexpected_embedder_load)
         second = ingest_files([path], user_id="alice", course_id="ECON303", store=store)
         assert second.files[0].status == "ok"
         assert "reused" in second.files[0].detail.lower()

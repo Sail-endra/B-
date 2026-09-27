@@ -58,10 +58,10 @@
   // Both funnel through here so there is exactly one HTML->IR implementation
   // to maintain.
 
-  async function htmlToBlocks(markup, warnings) {
+  async function htmlToBlocks(markup, warnings, assets) {
     const doc = new DOMParser().parseFromString(markup, "text/html");
     const blocks = [];
-    await walk(doc.body, blocks, warnings);
+    await walk(doc.body, blocks, warnings, assets);
     return blocks;
   }
 
@@ -75,7 +75,7 @@
   const SKIP_TAGS = new Set(["script", "style", "noscript", "template", "head", "title", "meta", "link", "svg", "iframe", "object", "button", "input", "select", "textarea"]);
   const BLOCK_SELECTOR = "p,div,ul,ol,table,img,pre,h1,h2,h3,h4,h5,h6,blockquote,section,article,header,footer,main,aside,center,hr,dl,figure";
 
-  async function walk(node, blocks, warnings) {
+  async function walk(node, blocks, warnings, assets) {
     let inline = [];
     const flushInline = () => {
       const text = inline.join("").replace(/[ \t\f\v\u00a0]+/g, " ").replace(/\s*\n\s*/g, "\n").trim();
@@ -122,19 +122,19 @@
         continue;
       }
       if (tag === "img") {
-        await handleImg(child, blocks, warnings);
+        await handleImg(child, blocks, warnings, assets);
         continue;
       }
       if (tag === "hr") continue;
 
       // p, div, center, section, li, ... - recurse; its inline text becomes
       // its own paragraph(s) and nested blocks keep their structure.
-      await walk(child, blocks, warnings);
+      await walk(child, blocks, warnings, assets);
     }
     flushInline();
   }
 
-  async function handleImg(img, blocks, warnings) {
+  async function handleImg(img, blocks, warnings, assets) {
     const src = img.getAttribute("src") || "";
     const caption = img.getAttribute("alt") || img.getAttribute("title") || "";
 
@@ -159,18 +159,13 @@
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const bytes = await res.arrayBuffer();
       const hash = await BBIR.hash(bytes);
-      pendingAssets.push({ hash, bytes, mimeType: res.headers.get("content-type") || "" });
+      assets.push({ hash, bytes, mimeType: res.headers.get("content-type") || "" });
       blocks.push(BBIR.image(hash, { caption }));
     } catch (err) {
       warnings.push(`Could not fetch a figure (${src.slice(0, 80)}): ${err.message}`);
       blocks.push(BBIR.unparsed("image-fetch-failed", { caption, originalUrl: src }));
     }
   }
-
-  // Assets discovered mid-parse accumulate here and get flushed back to
-  // background.js alongside the blocks for a single parse call. Reset per
-  // call in handleParse() below.
-  let pendingAssets = [];
 
   // ---- PDF -> blocks --------------------------------------------------
   //
@@ -187,7 +182,7 @@
   // diagram, or scanned figure at full visual fidelity - the thing a naive
   // "PDF -> plain text" conversion would have thrown away.
 
-  async function parsePdf(arrayBuffer, warnings) {
+  async function parsePdf(arrayBuffer, warnings, assets, parseState) {
     if (typeof pdfjsLib === "undefined") {
       warnings.push("PDF parsing library not vendored - see vendor/README.md.");
       return [BBIR.unparsed("missing-vendor-library:pdfjs")];
@@ -202,7 +197,6 @@
     // mid-render on some PDFs, not at load time).
     const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer, isEvalSupported: false });
     const pdf = await loadingTask.promise;
-    const myParse = parseGeneration;
     let pagesRasterized = 0;
     let pagesWithText = 0;
 
@@ -210,7 +204,7 @@
     for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
       // Stop promptly if this parse was abandoned (timed out), instead of
       // grinding on in the background and competing with the next file.
-      if (myParse !== parseGeneration) throw new Error("cancelled");
+      if (parseState.cancelled) throw new Error("cancelled");
       const page = await pdf.getPage(pageNum);
 
       // --- text, with a naive heading heuristic ---
@@ -263,7 +257,7 @@
           await page.render({ canvasContext: ctx, viewport, intent: "print" }).promise;
           const bytes = await canvasToArrayBuffer(canvas);
           const hash = await BBIR.hash(bytes);
-          pendingAssets.push({ hash, bytes, mimeType: "image/png" });
+          assets.push({ hash, bytes, mimeType: "image/png" });
           blocks.push(BBIR.image(hash, { page: pageNum, caption: `Page ${pageNum} figure(s)` }));
         }
       } catch (err) {
@@ -345,7 +339,7 @@
   // hits this in practice should tell us the specific case - it's the
   // clearest candidate for a dedicated OOXML-math -> LaTeX block later.
 
-  async function parseDocx(arrayBuffer, warnings) {
+  async function parseDocx(arrayBuffer, warnings, assets) {
     if (typeof mammoth === "undefined") {
       warnings.push("DOCX parsing library not vendored - see vendor/README.md.");
       return [BBIR.unparsed("missing-vendor-library:mammoth")];
@@ -359,7 +353,7 @@
             const base64 = await image.read("base64");
             const bytes = base64ToArrayBuffer(base64);
             const hash = await BBIR.hash(bytes);
-            pendingAssets.push({ hash, bytes, mimeType: image.contentType || "" });
+            assets.push({ hash, bytes, mimeType: image.contentType || "" });
             return { src: `bbir-asset://${hash}` };
           } catch (err) {
             warnings.push(`Could not extract an embedded DOCX image: ${err.message}`);
@@ -373,7 +367,7 @@
       if (msg.type === "warning") warnings.push(`mammoth: ${msg.message}`);
     }
 
-    return htmlToBlocks(result.value, warnings);
+    return htmlToBlocks(result.value, warnings, assets);
   }
 
   function base64ToArrayBuffer(base64) {
@@ -391,7 +385,7 @@
   // resolved through each slide's relationship file so a figure ends up
   // attached to the specific slide that uses it.
 
-  async function parsePptx(arrayBuffer, warnings) {
+  async function parsePptx(arrayBuffer, warnings, assets) {
     if (typeof JSZip === "undefined") {
       warnings.push("PPTX parsing library (JSZip) not vendored - see vendor/README.md.");
       return [BBIR.unparsed("missing-vendor-library:jszip")];
@@ -418,7 +412,7 @@
         if (text) blocks.push(BBIR.paragraph(text, { slide: slideNum }));
       }
 
-      await attachSlideImages(zip, name, slideNum, xml, blocks, warnings);
+      await attachSlideImages(zip, name, slideNum, xml, blocks, warnings, assets);
     }
 
     return blocks;
@@ -429,7 +423,7 @@
     return m ? Number(m[1]) : 0;
   }
 
-  async function attachSlideImages(zip, slidePath, slideNum, xml, blocks, warnings) {
+  async function attachSlideImages(zip, slidePath, slideNum, xml, blocks, warnings, assets) {
     const relsPath = slidePath.replace("slides/", "slides/_rels/") + ".rels";
     const relsFile = zip.file(relsPath);
     if (!relsFile) return;
@@ -456,7 +450,7 @@
       try {
         const bytes = await mediaFile.async("arraybuffer");
         const hash = await BBIR.hash(bytes);
-        pendingAssets.push({ hash, bytes, mimeType: mimeTypeForExt(mediaPath) });
+        assets.push({ hash, bytes, mimeType: mimeTypeForExt(mediaPath) });
         blocks.push(BBIR.image(hash, { slide: slideNum, caption: `Slide ${slideNum} image` }));
       } catch (err) {
         warnings.push(`Could not read slide ${slideNum} image (${target}): ${err.message}`);
@@ -488,9 +482,9 @@
   // Stored as a content-addressed asset exactly like figures inside PDFs,
   // so a vision-capable model can be handed the original pixels later.
 
-  async function parseImage(arrayBuffer, mimeType) {
+  async function parseImage(arrayBuffer, mimeType, assets) {
     const hash = await BBIR.hash(arrayBuffer);
-    pendingAssets.push({ hash, bytes: arrayBuffer, mimeType: mimeType || "application/octet-stream" });
+    assets.push({ hash, bytes: arrayBuffer, mimeType: mimeType || "application/octet-stream" });
     return [BBIR.image(hash, {})];
   }
 
@@ -508,19 +502,20 @@
   // Bump when parser output changes, so stored documents get re-parsed.
   // v3: everything stored before this fix may hold "{}" in place of bytes.
   const PARSER_VERSION = 4; // v4: HTML walker no longer drops loose/inline text
+  const withParseSlot = BBCourseWork.createSemaphore(2);
 
   class StageError extends Error {
     constructor(stage, reason) { super(reason); this.stage = stage; }
   }
 
-  async function parseSource(sourceType, payload, mimeType, warnings) {
+  async function parseSource(sourceType, payload, mimeType, warnings, assets, parseState) {
     switch (sourceType) {
-      case "html": return htmlToBlocks(payload, warnings);
-      case "pdf": return parsePdf(payload, warnings);
-      case "docx": return parseDocx(payload, warnings);
-      case "pptx": return parsePptx(payload, warnings);
+      case "html": return htmlToBlocks(payload, warnings, assets);
+      case "pdf": return parsePdf(payload, warnings, assets, parseState);
+      case "docx": return parseDocx(payload, warnings, assets);
+      case "pptx": return parsePptx(payload, warnings, assets);
       case "text": return parseText(payload, warnings);
-      case "image": return parseImage(payload, mimeType);
+      case "image": return parseImage(payload, mimeType, assets);
       default: return [BBIR.unparsed(`unsupported-source-type:${sourceType}`)];
     }
   }
@@ -562,34 +557,25 @@
     return (doc?.blocks || []).some((b) => b.type !== "unparsed");
   }
 
-  // A parser that never settles must not stall every file queued behind it
-  // (parsing is serialized). Budget scales with size: big textbooks get
+  // A parser that never settles must not stall every file queued behind it.
+  // Budget scales with size: big textbooks get
   // longer, but nothing gets forever.
   function parseTimeoutMs(payload) {
     const bytes = typeof payload === "string" ? payload.length : (payload?.byteLength || 0);
     return Math.min(10 * 60000, 60000 + Math.ceil(bytes / (1024 * 1024)) * 15000);
   }
 
-  // Incremented when a parse is abandoned; long-running parsers check it
-  // between pages and stop.
-  let parseGeneration = 0;
-
-  function withTimeout(promise, ms) {
+  function withTimeout(promise, ms, onTimeout) {
     let timer;
     return Promise.race([
       promise,
-      new Promise((_, reject) => { timer = setTimeout(() => { parseGeneration++; reject(new Error(`timed out after ${Math.round(ms / 1000)}s`)); }, ms); })
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          onTimeout?.();
+          reject(new Error(`timed out after ${Math.round(ms / 1000)}s`));
+        }, ms);
+      })
     ]).finally(() => clearTimeout(timer));
-  }
-
-  // Parsing is serialized: parsers push extracted figures into the shared
-  // `pendingAssets` array, so two concurrent parses would reset/steal each
-  // other's assets. Downloads (the slow part) still run concurrently.
-  let parseChain = Promise.resolve();
-  function serialized(fn) {
-    const run = parseChain.then(fn, fn);
-    parseChain = run.catch(() => {});
-    return run;
   }
 
   async function ingestJob(job) {
@@ -612,43 +598,47 @@
         return { ...base, ok: true, skipped: "unchanged" };
       }
 
-      return await serialized(async () => {
-        pendingAssets = [];
+      const parsed = await withParseSlot(async () => {
+        const assets = [];
         const warnings = [];
-        let blocks;
+        const parseState = { cancelled: false };
         try {
-          blocks = await withTimeout(parseSource(job.sourceType, payload, mimeType, warnings), parseTimeoutMs(payload));
+          const blocks = await withTimeout(
+            parseSource(job.sourceType, payload, mimeType, warnings, assets, parseState),
+            parseTimeoutMs(payload),
+            () => { parseState.cancelled = true; }
+          );
+          return { blocks, assets, warnings };
         } catch (err) {
           throw new StageError("parse", `parse-failed: ${err.message}`);
         }
-        const assets = pendingAssets;
-        pendingAssets = [];
-
-        if (!blocks.some((b) => b.type !== "unparsed")) {
-          if (existing) await BBDB.deleteDocument(job.itemId); // drop a stale shell
-          const reason = blocks.find((b) => b.type === "unparsed")?.reason || "no-content-extracted";
-          return { ...base, ok: false, stage: "parse", reason };
-        }
-
-        for (const asset of assets) {
-          await BBDB.putAsset(asset.hash, asset.bytes, { mimeType: asset.mimeType });
-        }
-        const doc = BBIR.makeDocument({
-          itemId: job.itemId, courseId: job.courseId, courseName: job.courseName,
-          title: job.title, sourceType: job.sourceType, sourceHash, blocks, warnings
-        });
-        doc.parserVersion = PARSER_VERSION;
-        await BBDB.putDocument(doc);
-        await BBDB.invalidateDerivedForCourse(job.courseId);
-
-        // Read it back: success means "it is in the database", not "we
-        // believe we wrote it".
-        const stored = await BBDB.getDocument(job.itemId);
-        if (!stored || !hasContent(stored)) {
-          return { ...base, ok: false, stage: "store", reason: "store-failed: document not readable after write" };
-        }
-        return { ...base, ok: true, blockCount: blocks.length, assetCount: assets.length, warnings };
       });
+      const { blocks, assets, warnings } = parsed;
+
+      if (!blocks.some((b) => b.type !== "unparsed")) {
+        if (existing) await BBDB.deleteDocument(job.itemId); // drop a stale shell
+        const reason = blocks.find((b) => b.type === "unparsed")?.reason || "no-content-extracted";
+        return { ...base, ok: false, stage: "parse", reason };
+      }
+
+      for (const asset of assets) {
+        await BBDB.putAsset(asset.hash, asset.bytes, { mimeType: asset.mimeType });
+      }
+      const doc = BBIR.makeDocument({
+        itemId: job.itemId, courseId: job.courseId, courseName: job.courseName,
+        title: job.title, sourceType: job.sourceType, sourceHash, blocks, warnings
+      });
+      doc.parserVersion = PARSER_VERSION;
+      await BBDB.putDocument(doc);
+      await BBDB.invalidateDerivedForCourse(job.courseId);
+
+      // Read it back: success means "it is in the database", not "we
+      // believe we wrote it".
+      const stored = await BBDB.getDocument(job.itemId);
+      if (!stored || !hasContent(stored)) {
+        return { ...base, ok: false, stage: "store", reason: "store-failed: document not readable after write" };
+      }
+      return { ...base, ok: true, blockCount: blocks.length, assetCount: assets.length, warnings };
     } catch (err) {
       return { ...base, ok: false, stage: err?.stage || "parse", reason: err?.message || String(err) };
     }

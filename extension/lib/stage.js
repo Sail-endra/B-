@@ -101,6 +101,27 @@
     return { ...staged, mimeType };
   }
 
+  // Download a file's bytes WITHOUT staging them (same fetch + HTML guard as
+  // fetchAndStage). Used to hand a PDF's raw bytes to the backend extractor,
+  // which is far stronger than the in-browser parser and can OCR scans.
+  async function fetchRaw(job) {
+    let res;
+    try {
+      res = await fetch(job.url, { credentials: "same-origin" });
+    } catch (err) {
+      throw fetchError(`fetch-failed: ${err.message}`);
+    }
+    if (!res.ok) throw fetchError(`fetch-failed: HTTP ${res.status}`);
+    const contentType = (res.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+    const u8 = new Uint8Array(await res.arrayBuffer());
+    if (!u8.byteLength) throw fetchError("fetch-failed: file was empty (0 bytes)");
+    const expectsMarkup = job.sourceType === "html" || job.sourceType === "text";
+    if (!expectsMarkup && (contentType === "text/html" || looksLikeHtml(u8))) {
+      throw fetchError("fetch-failed: Blackboard sent a web page instead of the file");
+    }
+    return { u8, mimeType: (contentType && contentType !== "application/octet-stream") ? contentType : "" };
+  }
+
   // Standalone File items (resource/x-bb-file) have NO download address in
   // Blackboard's public API - only fileName and mimeType. Ultra's own
   // internal folder listing does: each file result carries
@@ -267,5 +288,5 @@
     return { items: [...items.values()], requests, capReached, errors, containersListed: listed.size };
   }
 
-  root.BBStage = { fetchAndStage, stageBytes, listChildren, getContentItem, resolvePermanentUrls, censusCourse, looksLikeHtml, CHUNK_BYTES };
+  root.BBStage = { fetchAndStage, fetchRaw, stageBytes, toBase64, listChildren, getContentItem, resolvePermanentUrls, censusCourse, looksLikeHtml, CHUNK_BYTES };
 })(typeof globalThis !== "undefined" ? globalThis : this);
