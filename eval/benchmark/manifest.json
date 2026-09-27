@@ -1,0 +1,35 @@
+{
+  "name": "four-course benchmark",
+  "note": "The PDFs are NOT committed. They are the repo owner's own course materials, referenced in place under materials/. A benchmark run needs those files present; anyone else should point this manifest at their own corpus. Committing a purchased textbook would be redistribution.",
+  "user_id": "benchmark",
+  "courses": [
+    {
+      "course_id": "ECON303",
+      "code": "ECON 303",
+      "title": "Intermediate Microeconomic Theory",
+      "dir": "materials/econ303",
+      "expect_data_link": true
+    },
+    {
+      "course_id": "CSCI304",
+      "code": "CSCI 304",
+      "title": "Computer Organization",
+      "dir": "materials/csci304",
+      "expect_data_link": false
+    },
+    {
+      "course_id": "ANTH201",
+      "code": "ANTH 201",
+      "title": "Introduction to Archaeology",
+      "dir": "materials/anth201",
+      "expect_data_link": false
+    },
+    {
+      "course_id": "COLL150",
+      "code": "COLL 150",
+      "title": "Writing and Inquiry",
+      "dir": "materials/coll150",
+      "expect_data_link": false
+    }
+  ]
+}

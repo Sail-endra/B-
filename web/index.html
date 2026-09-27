@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Course Copilot</title>
+<link rel="preload" href="/static/fonts/SourceSerif4Var-Roman.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/MonaSansVF.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/static/css/app.css?v=2026092610">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.18.9/dist/katex.min.css" integrity="sha384-lPx0C4zIUZLpveABMwOFcFeGZwsvKBJfhJ85FN1PYOV7xApBcFMhcAEMVKF8loOI" crossorigin="anonymous">
+</head>
+<body>
+
+<header class="masthead">
+  <h1 class="title">Course Copilot <em>— read your own materials</em></h1>
+  <nav class="views" role="tablist">
+    <button role="tab" aria-selected="true" data-view="ask">Ask</button>
+    <button role="tab" aria-selected="false" data-view="dash">Schedule</button>
+    <button role="tab" aria-selected="false" data-view="practice">Practice</button>
+    <button role="tab" aria-selected="false" data-view="grades">Grade Predictor</button>
+  </nav>
+  <button class="plain" id="sheet-open">Courses &amp; uploads</button>
+  <button class="plain" id="ai-preferences">AI &amp; voice settings</button>
+  <button class="plain" id="theme-toggle" title="Light or dark">Light</button>
+  <div class="colophon" id="colophon"></div>
+</header>
+
+<!-- ─────────────── Consent (privacy boundary, per user) ─────────────── -->
+<div class="consent" id="consent-banner" hidden>
+  <div class="column">
+    <h3 class="label">AI privacy and explanations</h3>
+    <p class="consent-copy" id="consent-copy"></p>
+    <div class="stack" style="gap:12px;margin-top:12px">
+      <button class="plain" id="consent-yes">I agree — turn on free-tier Gemini</button>
+      <select id="consent-provider" aria-label="Your API key provider">
+        <option value="anthropic">Anthropic</option>
+        <option value="gemini">Gemini</option>
+      </select>
+      <input class="field" id="consent-key" type="password" style="flex:1 1 26ch"
+             placeholder="…or use your own API key" autocomplete="off">
+      <button class="plain" id="consent-key-save">Use my key</button>
+      <button class="plain" id="consent-no">Not now — quotes only</button>
+    </div>
+    <p class="note" id="consent-current"></p>
+    <section class="voice-settings" aria-labelledby="voice-settings-title">
+      <h3 class="label" id="voice-settings-title">Voice learning · ElevenLabs</h3>
+      <p class="note">With your permission, your recording is sent to ElevenLabs for transcription. When you choose Read aloud, the educational answer text is sent there for speech generation. Course Copilot does not keep the recording. ElevenLabs processes these requests under its own service terms; typed study remains available without voice.</p>
+      <p class="note" id="voice-consent-status" role="status" aria-live="polite"></p>
+      <div class="stack voice-settings-controls">
+        <button class="plain" id="voice-consent-accept" type="button">Allow voice processing with ElevenLabs</button>
+        <button class="plain" id="voice-consent-dismiss" type="button">Not now — continue typing</button>
+        <button class="plain" id="voice-consent-revoke" type="button" hidden>Revoke voice consent</button>
+        <label class="voice-option"><input type="checkbox" id="voice-only-toggle" disabled> Voice Only Mode</label>
+        <label class="voice-option"><input type="checkbox" id="voice-auto-submit" disabled checked> Automatically submit spoken questions in Voice Only Mode</label>
+        <label class="voice-option" for="voice-choice">Voice
+          <select id="voice-choice" disabled aria-label="ElevenLabs voice"></select>
+        </label>
+        <label class="voice-option" for="voice-speed">Speech speed
+          <select id="voice-speed" disabled aria-label="Speech speed">
+            <option value="0.8">Slow</option><option value="1">Normal</option><option value="1.2">Fast</option>
+          </select>
+        </label>
+      </div>
+      <p class="note" id="voice-settings-note" role="status" aria-live="polite"></p>
+    </section>
+  </div>
+</div>
+
+<!-- ───────────────────────────── Ask ───────────────────────────── -->
+<main class="view page" id="view-ask">
+  <div class="column">
+    <form class="ask" id="askform">
+      <div class="ask-main">
+        <input type="text" id="question" autocomplete="off"
+               aria-label="Ask a question about your course materials"
+               placeholder="Ask a question about your materials…">
+        <button type="button" class="plain voice-record" id="voice-record" aria-label="Start voice input" aria-pressed="false" aria-controls="voice-status">Ask by voice</button>
+        <button type="submit" id="asksubmit">Ask</button>
+      </div>
+      <div class="ask-options">
+        <select id="course" aria-label="Course"></select>
+        <select id="depth" aria-label="Explanation depth" title="Explanation depth">
+          <option value="concise">Concise</option>
+          <option value="in_depth">In-depth</option>
+        </select>
+      </div>
+    </form>
+
+      <div class="voice-status-row">
+        <p class="note" id="voice-status" role="status" aria-live="polite">Voice input is off. Activate the microphone button to record; it never listens in the background.</p>
+      </div>
+    <p class="visually-hidden" id="ask-status" role="status" aria-live="polite"></p>
+    <section id="voice-only-panel" class="voice-only-panel" hidden aria-live="polite">
+      <strong>Voice Only Mode is on.</strong>
+      <span>The microphone listens only after you activate it.</span>
+      <button type="button" class="plain" id="voice-only-exit">Exit Voice Only Mode</button>
+    </section>
+
+    <p class="note" id="course-note"></p>
+
+    <section id="explain-section" hidden>
+      <div class="label bare" id="explain-label">Explanation · concise</div>
+      <div class="reading" id="explanation"></div>
+      <div class="voice-playback" id="explanation-voice-controls" hidden></div>
+      <button class="plain" id="go-deeper" hidden>Go deeper &rarr;</button>
+    </section>
+
+    <section id="answer-section" hidden>
+      <h2 class="label">From the text</h2>
+      <!-- Sidenotes are emitted here as siblings of the prose, so each one
+           floats into the margin lane beside the line that references it. The
+           apparatus blocks below float into the same lane and stack under them. -->
+      <div class="reading" id="answer"></div>
+      <div class="voice-playback" id="answer-voice-controls" hidden></div>
+    </section>
+
+    <aside class="apparatus" id="steps-section" hidden>
+      <h2 class="label">Retrieval</h2>
+      <ul class="ledger" id="steps"></ul>
+    </aside>
+    <aside class="apparatus" id="data-section" hidden>
+      <h2 class="label">Real-world data</h2>
+      <div id="datacard"></div>
+    </aside>
+
+    <section id="passages-section" hidden>
+      <h2 class="subopener">Passages</h2>
+      <div id="passages"></div>
+    </section>
+  </div>
+</main>
+
+<!-- ─────────────────────── Grade Predictor ─────────────────────── -->
+<main class="view page" id="view-grades" hidden>
+  <div class="column">
+    <h2 class="opener">Grade Predictor</h2>
+    <label class="plain" for="grades-course">Course</label>
+    <select id="grades-course" aria-label="Course"></select>
+    <p class="note" id="grades-status" role="status" aria-live="polite"></p>
+    <section id="grade-syllabus" aria-live="polite">
+      <h3 class="label">Syllabus</h3>
+      <p class="fine" id="grade-syllabus-info"></p>
+      <select id="grade-syllabus-choice" aria-label="Select syllabus" hidden></select>
+      <div class="stack" style="gap:10px">
+        <button class="plain" id="grade-syllabus-use" type="button" hidden>Use Selected Syllabus</button>
+        <button class="plain" id="grade-syllabus-analyze" type="button" hidden>Analyze Grading Structure</button>
+        <button class="plain" id="grade-syllabus-reanalyze" type="button" hidden>Re-analyze Syllabus</button>
+        <button class="plain" id="grade-syllabus-retry" type="button" hidden>Retry</button>
+        <button class="plain" id="grade-syllabus-upload" type="button">Upload Syllabus</button>
+        <input id="grade-syllabus-file" type="file" accept=".pdf,.docx,.md,.txt" hidden>
+      </div>
+    </section>
+    <section id="grade-review" hidden>
+      <h3 class="label">Review grading structure</h3>
+      <p class="fine">This is an AI proposal from the syllabus. Edit it, then confirm to create your grade fields. Your saved scores stay separate.</p>
+      <div id="grade-diff"></div>
+      <div id="grade-review-fields"></div>
+      <button class="plain" id="grade-add-category" type="button">Add category</button>
+      <div id="grade-uncertainties"></div>
+      <button id="grade-confirm" type="button">Confirm grade structure</button>
+    </section>
+    <section id="grade-main" hidden>
+      <div id="grade-summary" class="grade-summary" role="status" aria-live="polite"></div>
+
+      <section class="grade-block">
+        <div class="grade-block-head">
+          <h3 class="grade-h">Your scores</h3>
+          <button class="plain" id="grade-edit-structure" type="button">Adjust grading structure</button>
+        </div>
+        <p class="grade-sub">Enter a score for each test you have already taken. Leave the ones
+          you haven't taken yet <strong>blank</strong> — those are what the predictor solves for.</p>
+        <div id="grade-fields" class="grade-scores"></div>
+      </section>
+
+      <section class="grade-block">
+        <h3 class="grade-h">What you need on the tests you haven't taken</h3>
+        <p class="grade-sub" id="grade-needed-note"></p>
+        <div id="grade-ladder" aria-live="polite"></div>
+      </section>
+    </section>
+  </div>
+</main>
+
+<!-- ────────────────────────── Schedule ────────────────────────── -->
+<main class="view page" id="view-dash" hidden>
+  <div class="column">
+    <h2 class="opener" id="dash-opener">Schedule</h2>
+
+    <div id="due-banner" hidden></div>
+
+    <!-- Task-completion rings: how much of the work is done. -->
+    <div class="cal-rings" id="cal-rings" aria-label="Work completed"></div>
+
+    <section class="cal-wrap" aria-label="Calendar">
+      <div class="cal-toolbar">
+        <div class="cal-nav">
+          <button class="plain cal-arrow" id="cal-prev" type="button" aria-label="Previous month">‹</button>
+          <h3 class="cal-month" id="cal-month" aria-live="polite">—</h3>
+          <button class="plain cal-arrow" id="cal-next" type="button" aria-label="Next month">›</button>
+        </div>
+        <div class="cal-actions">
+          <button class="plain" id="cal-today" type="button">Today</button>
+          <button class="plain" id="cal-add" type="button">+ Add event</button>
+        </div>
+      </div>
+      <div class="cal-weekhead" aria-hidden="true">
+        <span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span>
+      </div>
+      <div class="cal-grid" id="cal-grid" role="grid" aria-label="Month grid"></div>
+      <div class="cal-legend" id="cal-legend"></div>
+    </section>
+
+    <!-- Day detail: the elevated single-day view, opened by clicking a day. -->
+    <section class="cal-day" id="cal-day" hidden aria-live="polite">
+      <div class="cal-day-head">
+        <h3 class="cal-day-title" id="cal-day-title"></h3>
+        <button class="plain" id="cal-day-close" type="button">Close</button>
+      </div>
+      <div id="cal-day-body"></div>
+    </section>
+
+    <!-- Add / edit an event. -->
+    <form class="cal-form" id="cal-form" hidden>
+      <div class="cal-form-head">
+        <h3 class="grade-h" id="cal-form-title">Add event</h3>
+        <button class="plain" id="cal-form-cancel" type="button">Cancel</button>
+      </div>
+      <div class="cal-form-grid">
+        <label class="cal-fl">Title<input class="grade-input cal-fi" id="ev-title" type="text" required></label>
+        <label class="cal-fl">Course<select class="cal-fi" id="ev-course"></select></label>
+        <label class="cal-fl">Type<select class="cal-fi" id="ev-kind">
+          <option value="class">Class</option><option value="club">Club</option>
+          <option value="meeting">Meeting</option><option value="deadline">Deadline</option>
+          <option value="exam">Exam</option><option value="project">Project</option>
+          <option value="research">Research</option><option value="job">Job</option>
+          <option value="custom">Other</option></select></label>
+        <label class="cal-fl">Date<input class="grade-input cal-fi" id="ev-date" type="date"></label>
+        <label class="cal-fl">Start<input class="grade-input cal-fi" id="ev-start" type="time"></label>
+        <label class="cal-fl">End<input class="grade-input cal-fi" id="ev-end" type="time"></label>
+        <label class="cal-fl cal-fl-wide">Location<input class="grade-input cal-fi" id="ev-loc" type="text"></label>
+      </div>
+      <label class="cal-recur"><input type="checkbox" id="ev-recur"> Repeats weekly</label>
+      <div class="cal-recur-opts" id="ev-recur-opts" hidden>
+        <div class="cal-days" id="ev-days" role="group" aria-label="Repeat on"></div>
+        <label class="cal-fl">Until<input class="grade-input cal-fi" id="ev-until" type="date"></label>
+      </div>
+      <div class="cal-form-foot">
+        <button type="submit" id="ev-save">Save event</button>
+        <button class="plain" id="ev-delete" type="button" hidden>Delete</button>
+        <span class="fine" id="ev-status"></span>
+      </div>
+    </form>
+
+    <section id="progress-section">
+      <h3 class="label">Engagement <span id="progress-scope" class="scope"></span></h3>
+      <div id="progress"></div>
+      <p class="fine">This is <em>engagement</em> — topics you have asked about —
+        not a measure of how well you have learned them, and separate from the work
+        completed above.</p>
+    </section>
+
+    <section id="exam-section">
+      <h3 class="subopener" id="exam-head">Exam readiness</h3>
+      <div class="readiness" id="exam"></div>
+    </section>
+
+    <section id="undated-section" hidden>
+      <h3 class="subopener">Outline (no dates)</h3>
+      <p class="fine" id="undated-note"></p>
+      <table class="plate"><tbody id="undated"></tbody></table>
+    </section>
+
+    <section id="assess-section">
+      <div class="stack" style="justify-content:space-between">
+        <h3 class="subopener" style="margin:0">Assessments</h3>
+        <button class="plain" id="assess-add">+ Add</button>
+      </div>
+      <form id="assess-form" hidden></form>
+      <div id="assessments"></div>
+      <p class="fine"><a id="cal-link" href="#">Subscribe in your calendar</a>
+        — reminders at 7, 3 and 1 days before each due date.</p>
+    </section>
+  </div>
+</main>
+
+<!-- ────────────────────────── Practice ────────────────────────── -->
+<main class="view page" id="view-practice" hidden>
+  <div class="column">
+    <h2 class="opener">Practice</h2>
+    <div class="stack" style="align-items:baseline;gap:16px">
+      <select id="practice-course" aria-label="Course"></select>
+      <label class="plain upload-practice" for="practice-files">Upload assignment or past exam</label>
+      <input id="practice-files" type="file" multiple accept=".pdf,.docx,.txt,.md" hidden>
+      <div class="modeswitch" role="tablist">
+        <button class="plain" id="mode-practice" data-mode="practice" aria-selected="true">Practice</button>
+        <button class="plain" id="mode-test" data-mode="test" aria-selected="false">Test yourself</button>
+      </div>
+    </div>
+    <p class="note" id="practice-note"></p>
+    <div id="practice-upload-status" aria-live="polite"></div>
+    <p class="note integrity" id="integrity-note">
+      Uploaded problems from your own assignments get hints and method only — never
+      the final answer. Generated variants get everything, because working a variant
+      is studying and working the assigned problem is not.
+    </p>
+    <div id="practice-body"></div>
+  </div>
+</main>
+
+<!-- ─────────────────── Courses, uploads, review ─────────────────── -->
+<div class="sheet" id="sheet" hidden>
+  <div class="inner">
+    <div class="head">
+      <h2 class="opener" style="margin:0">Courses &amp; uploads</h2>
+      <button class="plain" id="sheet-close">Close</button>
+    </div>
+
+    <h3 class="label">Add a course</h3>
+    <form class="stack" id="newcourse" style="margin-bottom:44px">
+      <input class="field" style="flex:1 1 20ch" type="text" id="nc-code"
+             placeholder="Course code, e.g. ECON 303" required>
+      <input class="field" style="flex:1 1 20ch" type="text" id="nc-title"
+             placeholder="Title (optional)">
+      <button class="plain" type="submit">Create</button>
+    </form>
+
+    <h3 class="label">Your courses</h3>
+    <div id="courselist"></div>
+
+    <section id="review-section" hidden style="margin-top:44px">
+      <h3 class="label">Rows needing review</h3>
+      <p class="note" id="review-summary"></p>
+      <div id="reviewrows"></div>
+      <button class="plain" id="review-save" style="margin-top:18px">Save corrections</button>
+    </section>
+
+    <hr>
+    <section id="course-cleanup-section" aria-labelledby="course-cleanup-title">
+      <h3 class="label" id="course-cleanup-title">Delete courses and uploads</h3>
+      <p class="fine">Remove selected materials, syllabus data, assessment uploads, or an entire course. You’ll review the exact records before confirming.</p>
+      <button class="plain destructive-action" id="course-delete-open" type="button">Review deletion options</button>
+    </section>
+  </div>
+</div>
+
+<dialog id="course-delete-dialog" aria-labelledby="course-delete-title">
+  <div class="course-delete-dialog-inner">
+    <div class="head">
+      <h2 class="opener" id="course-delete-title" style="margin:0">Delete courses and uploads</h2>
+      <button class="plain" id="course-delete-close" type="button">Close</button>
+    </div>
+    <p class="note">Select courses and choose what to remove. The counts update to show the records and files in each selected scope.</p>
+    <label class="course-delete-selectall"><input id="course-delete-all" type="checkbox"> Select all courses</label>
+    <div id="course-delete-list"></div>
+    <div id="course-delete-confirmation" class="course-delete-confirmation"></div>
+    <label class="fine" for="course-delete-phrase">Type the confirmation phrase</label>
+    <input class="field" id="course-delete-phrase" type="text" autocomplete="off" spellcheck="false">
+    <div class="stack course-delete-actions">
+      <button class="plain destructive-action" id="course-delete-confirm" type="button" disabled>Delete selected data</button>
+      <button class="plain" id="course-delete-cancel" type="button">Cancel</button>
+    </div>
+    <p id="course-delete-status" role="status" aria-live="polite"></p>
+    <p class="fine" id="course-delete-cache-note"></p>
+  </div>
+</dialog>
+
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.18.9/dist/katex.min.js" integrity="sha384-19KE2cFb3U+RUWmyhBz7aLOGDG8WrRC6hE3oY/HTZZlAAVWYTdmvLC//+TIV3zUx" crossorigin="anonymous"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.18.9/dist/contrib/auto-render.min.js" integrity="sha384-bjyGPfbij8/NDKJhSGZNP/khQVgtHUE5exjm4Ydllo42FwIgYsdLO2lXGmRBf5Mz" crossorigin="anonymous"></script>
+<script type="module" src="/static/js/app.js?v=2026092610"></script>
+</body>
+</html>

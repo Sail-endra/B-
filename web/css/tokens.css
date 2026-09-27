@@ -1,0 +1,160 @@
+/* Course Copilot — design tokens
+ *
+ * Scholarly editorial: a well-set academic book crossed with a data plate.
+ * The product is a reading instrument, so the serif and the measure are the
+ * primary decisions and everything else defers to them.
+ *
+ * Rules this file enforces:
+ *   - Two families. Source Serif 4 reads; Mona Sans labels. No third family.
+ *   - One interaction accent. Status colours are desaturated and used only for
+ *     status. Chart series colours are NOT here — they are scoped to .figure so
+ *     they can never leak into navigation or buttons.
+ *   - Three text steps: primary, secondary, muted.
+ *   - No radius, no shadow. Hierarchy comes from rules, spacing and type scale.
+ */
+
+/* ── faces ─────────────────────────────────────────────────────────────── */
+
+@font-face {
+  font-family: "Source Serif 4";
+  src: url("/static/fonts/SourceSerif4Var-Roman.woff2") format("woff2-variations");
+  font-weight: 200 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Source Serif 4";
+  src: url("/static/fonts/SourceSerif4Var-Italic.woff2") format("woff2-variations");
+  font-weight: 200 900;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Mona Sans";
+  src: url("/static/fonts/MonaSansVF.woff2") format("woff2-variations");
+  font-weight: 200 900;
+  font-stretch: 75% 125%;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Mona Sans";
+  src: url("/static/fonts/MonaSansVF-Italic.woff2") format("woff2-variations");
+  font-weight: 200 900;
+  font-stretch: 75% 125%;
+  font-style: italic;
+  font-display: swap;
+}
+
+:root {
+  /* ── type ────────────────────────────────────────────────────────────── */
+  --font-read: "Source Serif 4", Georgia, "Iowan Old Style", serif;
+  --font-ui: "Mona Sans", "Helvetica Neue", Arial, sans-serif;
+
+  /* Reading: 18.5px at 1.6, capped at 66 characters. A passage never runs the
+     full width of the window, whatever the window is doing. */
+  --read-size: 18.5px;
+  --read-leading: 1.6;
+  --measure: 66ch;
+
+  /* Interface scale. Ratio 1.2, rounded to whole pixels so rules land on the
+     pixel grid at 1x. */
+  --ui-xs: 11px;    /* condensed metadata, axis labels */
+  --ui-sm: 12px;    /* table headers, captions */
+  --ui-base: 14px;  /* navigation, buttons, form text */
+  --ui-md: 16px;
+  --serif-lg: 21px; /* subsection openers */
+  --serif-xl: 28px; /* section openers — the serif, larger. Not another face. */
+
+  --sidenote-size: 0.87em;
+  --sidenote-leading: 1.4;
+
+  /* Condensed width, for places density is the point and nowhere else. */
+  --wdth-condensed: 82;
+  --wdth-normal: 100;
+
+  /* ── space ───────────────────────────────────────────────────────────── */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 18px;
+  --sp-5: 28px;
+  --sp-6: 44px;
+  --sp-7: 68px;
+
+  --margin-col: 280px;
+  --margin-gap: 40px;
+  --rule: 1px;
+
+  /* ── dark (default): warm near-black, not blue-slate ─────────────────── */
+  --ground: #14120f;
+  --ground-raised: #1b1814;
+  --ground-sunken: #0e0c0a;
+
+  --ink: #ece6dc;        /* primary   */
+  --ink-2: #a89f92;      /* secondary */
+  --ink-3: #746c61;      /* muted     */
+
+  --rule-colour: #302b25;
+  --rule-strong: #484036;
+
+  /* One interaction accent. Links, focus rings, active nav. Nothing else.
+     A rubric red — the colour a scribe used for the parts that matter. */
+  --accent: #c2704a;
+  --accent-quiet: #8d4f33;
+
+  /* Status only. Desaturated on purpose: they report state, they do not
+     decorate. */
+  --status-engaged: #6f8a63;
+  --status-due: #9a854f;
+  --status-overdue: #a35f52;
+
+  --selection: rgba(194, 112, 74, 0.28);
+  color-scheme: dark;
+}
+
+/* ── light: warm paper ───────────────────────────────────────────────────
+   A reading tool gets used in both. This is a full token set, not a filter. */
+
+:root[data-theme="light"] {
+  --ground: #fbf8f2;
+  --ground-raised: #f4efe5;
+  --ground-sunken: #ede7db;
+
+  --ink: #1d1913;
+  --ink-2: #57503f;
+  --ink-3: #857c6c;
+
+  --rule-colour: #ded6c6;
+  --rule-strong: #c3b9a5;
+
+  --accent: #a3502c;
+  --accent-quiet: #7d3c20;
+
+  --status-engaged: #4d6642;
+  --status-due: #7a6420;
+  --status-overdue: #8b3f31;
+
+  --selection: rgba(163, 80, 44, 0.20);
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --ground: #fbf8f2;
+    --ground-raised: #f4efe5;
+    --ground-sunken: #ede7db;
+    --ink: #1d1913;
+    --ink-2: #57503f;
+    --ink-3: #857c6c;
+    --rule-colour: #ded6c6;
+    --rule-strong: #c3b9a5;
+    --accent: #a3502c;
+    --accent-quiet: #7d3c20;
+    --status-engaged: #4d6642;
+    --status-due: #7a6420;
+    --status-overdue: #8b3f31;
+    --selection: rgba(163, 80, 44, 0.20);
+    color-scheme: light;
+  }
+}
