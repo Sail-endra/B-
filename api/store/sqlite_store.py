@@ -159,17 +159,22 @@ class SQLiteStore:
         )
         self.conn.commit()
 
-    def source_with_hash(self, user_id: str, course_id: str, file_hash: str) -> Optional[str]:
+    def source_with_hash(self, user_id: str, course_id: str, file_hash: str,
+                         source_id: Optional[str] = None) -> Optional[str]:
         """source_id of an already-ingested, OK file with this content hash in this
-        course, or None. Used to skip re-ingesting an identical re-upload."""
+        course, or None. BB Plus may supply a stable item source_id so two
+        Blackboard items with identical bytes still retain distinct identities."""
         if not file_hash:
             return None
+        source_filter = " AND s.source_id=?" if source_id else ""
+        params: tuple[Any, ...] = (user_id, course_id, file_hash, source_id) if source_id else (user_id, course_id, file_hash)
         row = self.conn.execute(
             "SELECT s.source_id FROM sources s WHERE s.user_id=? AND s.course_id=? "
             "AND s.file_hash=? AND s.status='ok' "
+            + source_filter + " "
             "AND EXISTS (SELECT 1 FROM chunks c WHERE c.user_id=s.user_id AND c.source_id=s.source_id) "
             "LIMIT 1",
-            (user_id, course_id, file_hash),
+            params,
         ).fetchone()
         return row["source_id"] if row else None
 
@@ -182,6 +187,40 @@ class SQLiteStore:
                    bool(r["has_data_link"]), r["data_link_reason"])
             for r in rows
         ]
+
+    def bbplus_course_mappings(self, user_id: str) -> list[dict[str, str]]:
+        rows = self.conn.execute(
+            "SELECT blackboard_course_id,blackboard_course_name,course_id "
+            "FROM bbplus_course_mappings WHERE user_id=? ORDER BY blackboard_course_name,blackboard_course_id",
+            (user_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def bbplus_course_mapping(self, user_id: str, blackboard_course_id: str) -> Optional[dict[str, str]]:
+        row = self.conn.execute(
+            "SELECT blackboard_course_id,blackboard_course_name,course_id "
+            "FROM bbplus_course_mappings WHERE user_id=? AND blackboard_course_id=?",
+            (user_id, blackboard_course_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    @_serialized
+    def set_bbplus_course_mapping(self, user_id: str, blackboard_course_id: str,
+                                  blackboard_course_name: str, course_id: str) -> None:
+        if user_id == "benchmark":
+            raise PermissionError("The benchmark user cannot be changed through product integrations.")
+        if not blackboard_course_id or len(blackboard_course_id) > 300:
+            raise ValueError("A valid Blackboard course ID is required.")
+        if self.course(user_id, course_id) is None:
+            raise KeyError("course not found")
+        now = _now()
+        self.conn.execute(
+            "INSERT INTO bbplus_course_mappings(user_id,blackboard_course_id,blackboard_course_name,course_id,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(user_id,blackboard_course_id) DO UPDATE SET "
+            "blackboard_course_name=excluded.blackboard_course_name,course_id=excluded.course_id,updated_at=excluded.updated_at",
+            (user_id, blackboard_course_id, blackboard_course_name[:300], course_id, now, now),
+        )
+        self.conn.commit()
 
     @_serialized
     def upsert_course_stub(self, user_id: str, course_id: str, code: str, title: str) -> None:
@@ -424,7 +463,7 @@ class SQLiteStore:
         material_source_sql = "SELECT source_id FROM sources WHERE user_id=? AND course_id=? AND type IN ('textbook','slides','notes','bbplus')"
         syllabus_source_sql = "SELECT source_id FROM sources WHERE user_id=? AND course_id=? AND (type='syllabus' OR lower(file) LIKE '%syllabus%' OR lower(file) LIKE '%course_outline%' OR lower(file) LIKE '%course-outline%' OR lower(file) LIKE '%syll%')"
         assessment_source_sql = "SELECT source_id FROM sources WHERE user_id=? AND course_id=? AND type='assessment'"
-        mats = count("SELECT COUNT(*) FROM sources WHERE user_id=? AND course_id=? AND type IN ('textbook','slides','notes')", base)
+        mats = count("SELECT COUNT(*) FROM sources WHERE user_id=? AND course_id=? AND type IN ('textbook','slides','notes','bbplus')", base)
         material_chunks = count(f"SELECT COUNT(*) FROM chunks WHERE user_id=? AND course_id=? AND source_id IN ({material_source_sql})", base + base)
         material_chapters = count(f"SELECT COUNT(*) FROM chapters WHERE user_id=? AND course_id=? AND source_id IN ({material_source_sql})", base + base)
         material_parents = count(f"SELECT COUNT(*) FROM parents WHERE user_id=? AND source_id IN ({material_source_sql})", (user_id,) + base)

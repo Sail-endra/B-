@@ -1,17 +1,4 @@
-/* Course Copilot — design tokens
- *
- * Scholarly editorial: a well-set academic book crossed with a data plate.
- * The product is a reading instrument, so the serif and the measure are the
- * primary decisions and everything else defers to them.
- *
- * Rules this file enforces:
- *   - Two families. Source Serif 4 reads; Mona Sans labels. No third family.
- *   - One interaction accent. Status colours are desaturated and used only for
- *     status. Chart series colours are NOT here — they are scoped to .figure so
- *     they can never leak into navigation or buttons.
- *   - Three text steps: primary, secondary, muted.
- *   - No radius, no shadow. Hierarchy comes from rules, spacing and type scale.
- */
+/* Unified BB Plus + Course Copilot palette, shared by the web app and drawer. */
 
 /* ── faces ─────────────────────────────────────────────────────────────── */
 
@@ -48,8 +35,8 @@
 
 :root {
   /* ── type ────────────────────────────────────────────────────────────── */
-  --font-read: "Source Serif 4", Georgia, "Iowan Old Style", serif;
-  --font-ui: "Mona Sans", "Helvetica Neue", Arial, sans-serif;
+  --font-read: "Open Sans", "Helvetica Neue", Arial, sans-serif;
+  --font-ui: "Open Sans", "Helvetica Neue", Arial, sans-serif;
 
   /* Reading: 18.5px at 1.6, capped at 66 characters. A passage never runs the
      full width of the window, whatever the window is doing. */
@@ -86,75 +73,72 @@
   --margin-gap: 40px;
   --rule: 1px;
 
-  /* ── dark (default): warm near-black, not blue-slate ─────────────────── */
-  --ground: #14120f;
-  --ground-raised: #1b1814;
-  --ground-sunken: #0e0c0a;
+  /* ── dark mode follows BB Plus's Blackboard-friendly neutral palette ── */
+  --ground: #202124;
+  --ground-raised: #2b2d31;
+  --ground-sunken: #17181a;
 
-  --ink: #ece6dc;        /* primary   */
-  --ink-2: #a89f92;      /* secondary */
-  --ink-3: #746c61;      /* muted     */
+  --ink: #f1f3f4;
+  --ink-2: #bdc1c6;
+  --ink-3: #9aa0a6;
 
-  --rule-colour: #302b25;
-  --rule-strong: #484036;
+  --rule-colour: #3c4043;
+  --rule-strong: #5f6368;
 
-  /* One interaction accent. Links, focus rings, active nav. Nothing else.
-     A rubric red — the colour a scribe used for the parts that matter. */
-  --accent: #c2704a;
-  --accent-quiet: #8d4f33;
+  --accent: #8ab4f8;
+  --accent-quiet: #669df6;
 
   /* Status only. Desaturated on purpose: they report state, they do not
      decorate. */
-  --status-engaged: #6f8a63;
-  --status-due: #9a854f;
-  --status-overdue: #a35f52;
+  --status-engaged: #81c995;
+  --status-due: #fdd663;
+  --status-overdue: #f28b82;
 
-  --selection: rgba(194, 112, 74, 0.28);
+  --selection: rgba(138, 180, 248, 0.28);
   color-scheme: dark;
 }
 
-/* ── light: warm paper ───────────────────────────────────────────────────
-   A reading tool gets used in both. This is a full token set, not a filter. */
+/* ── light mode follows BB Plus's white, blue, and neutral palette ─────── */
 
 :root[data-theme="light"] {
-  --ground: #fbf8f2;
-  --ground-raised: #f4efe5;
-  --ground-sunken: #ede7db;
+  --ground: #ffffff;
+  --ground-raised: #f8f9fa;
+  --ground-sunken: #f1f3f4;
 
-  --ink: #1d1913;
-  --ink-2: #57503f;
-  --ink-3: #857c6c;
+  --ink: #262626;
+  --ink-2: #3c4043;
+  --ink-3: #5f6368;
 
-  --rule-colour: #ded6c6;
-  --rule-strong: #c3b9a5;
+  --rule-colour: #d7d9dc;
+  --rule-strong: #b8bdc3;
 
-  --accent: #a3502c;
-  --accent-quiet: #7d3c20;
+  --accent: #1f5a94;
+  --accent-quiet: #174673;
 
-  --status-engaged: #4d6642;
-  --status-due: #7a6420;
-  --status-overdue: #8b3f31;
+  --status-engaged: #137333;
+  --status-due: #8a5b00;
+  --status-overdue: #b3261e;
 
-  --selection: rgba(163, 80, 44, 0.20);
+  --selection: rgba(31, 90, 148, 0.18);
   color-scheme: light;
 }
 
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
-    --ground: #fbf8f2;
-    --ground-raised: #f4efe5;
-    --ground-sunken: #ede7db;
-    --ink: #1d1913;
-    --ink-2: #57503f;
-    --ink-3: #857c6c;
-    --rule-colour: #ded6c6;
-    --rule-strong: #c3b9a5;
-    --accent: #a3502c;
-    --accent-quiet: #7d3c20;
-    --status-engaged: #4d6642;
-    --status-due: #7a6420;
-    --status-overdue: #8b3f31;
-    --selection: rgba(163, 80, 44, 0.20);
+    --ground: #ffffff;
+    --ground-raised: #f8f9fa;
+    --ground-sunken: #f1f3f4;
+    --ink: #262626;
+    --ink-2: #3c4043;
+    --ink-3: #5f6368;
+    --rule-colour: #d7d9dc;
+    --rule-strong: #b8bdc3;
+    --accent: #1f5a94;
+    --accent-quiet: #174673;
+    --status-engaged: #137333;
+    --status-due: #8a5b00;
+    --status-overdue: #b3261e;
+    --selection: rgba(31, 90, 148, 0.18);
     color-scheme: light;
   }
 }

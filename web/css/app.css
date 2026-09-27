@@ -953,6 +953,130 @@ table.plate td .topic { font-family: var(--font-read); font-size: 16px; color: v
 .grade-ladder-guaranteed { background: color-mix(in srgb, var(--status-engaged) 8%, transparent); }
 #grade-edit-structure { font-size: var(--ui-sm); }
 
+/* Unified application shell: match BB Plus's compact neutral surfaces, blue
+   actions, accessible controls, and responsive drawer behavior. */
+body {
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font-ui);
+}
+
+.masthead {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  align-items: center;
+  gap: 12px 20px;
+  padding: 12px 20px;
+  background: var(--ground-raised);
+  border-bottom: 1px solid var(--rule-colour);
+}
+
+.masthead .title { font-size: 16px; color: var(--ink); }
+.masthead .title em { color: var(--ink-3); font-size: 13px; }
+.views { gap: 16px; }
+.views button { font-size: 13px; }
+.colophon { color: var(--ink-3); }
+
+.plain {
+  border: 1px solid var(--rule-colour);
+  border-radius: 4px;
+  padding: 6px 9px;
+  background: var(--ground-raised);
+  color: var(--ink-2);
+  font-size: 13px;
+}
+.plain:hover { border-color: var(--accent); color: var(--accent); }
+
+.page { padding: 30px 24px 56px; }
+.column,
+#view-grades .column,
+#view-dash .column {
+  max-width: 980px;
+}
+.opener, .subopener { color: var(--ink); font-family: var(--font-ui); font-weight: 650; }
+.opener { font-size: 25px; }
+.subopener { font-size: 18px; }
+.label { color: var(--ink-2); }
+
+.ask {
+  max-width: 900px;
+  padding: 12px;
+  border: 1px solid var(--rule-colour);
+  border-radius: 6px;
+  background: var(--ground-raised);
+}
+.ask-main { align-items: center; }
+.ask input[type="text"] {
+  padding: 9px 10px;
+  border: 1px solid var(--rule-colour);
+  border-radius: 4px;
+  background: var(--ground);
+  font-family: var(--font-ui);
+  font-size: 14px;
+}
+.ask input::placeholder { font-style: normal; }
+.ask:focus-within { border-color: var(--accent); }
+.ask button:not(.voice-record),
+#asksubmit {
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 8px 12px;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 650;
+}
+.ask button.voice-record { border: 0; background: transparent; color: var(--accent); }
+.ask button[disabled] { opacity: .6; }
+.ask-options { gap: 10px; }
+select, .field, textarea.field {
+  min-height: 36px;
+  padding: 7px 9px;
+  border: 1px solid var(--rule-colour);
+  border-radius: 4px;
+  background: var(--ground);
+  color: var(--ink);
+  font: inherit;
+}
+.reading { max-width: 76ch; font-family: var(--font-ui); font-size: 16px; line-height: 1.65; }
+.reading p { margin-bottom: 14px; }
+.field:focus, select:focus { outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent); border-color: var(--accent); }
+
+.sheet {
+  left: auto;
+  width: min(720px, 100vw);
+  border-left: 1px solid var(--rule-colour);
+  background: var(--ground);
+  box-shadow: -8px 0 24px rgb(0 0 0 / 14%);
+}
+.sheet .inner { max-width: none; padding: 18px 20px 36px; }
+.sheet .head { align-items: center; }
+.sheet .head .opener { font-size: 21px; }
+.courserow { margin: 8px 0; padding: 12px; border: 1px solid var(--rule-colour); border-radius: 5px; background: var(--ground-raised); }
+.courserow .code { font-family: var(--font-ui); font-size: 14px; font-weight: 700; }
+
+.grade-summary, .grade-cat, .practice-card, .test-set .practice-card,
+.course-delete-course, .consent {
+  border-radius: 6px;
+}
+.grade-summary, .grade-cat, .test-set .practice-card { background: var(--ground-raised); }
+.grade-now-val, .grade-h, .grade-ladder-letter, .gl-need,
+.practice-prompt, .practice-score { font-family: var(--font-ui); }
+.grade-input { border-radius: 4px; background: var(--ground); }
+.course-delete-dialog-inner { background: var(--ground); }
+#course-delete-dialog { border-radius: 8px; box-shadow: 0 16px 48px rgb(0 0 0 / 24%); }
+.consent { border: 1px solid var(--rule-colour); background: var(--ground-raised); box-shadow: 0 8px 28px rgb(0 0 0 / 12%); }
+
+@media (max-width: 720px) {
+  .masthead { position: relative; padding: 12px 14px; }
+  .page { padding: 22px 14px 40px; }
+  .masthead .title { flex: 1 1 100%; }
+  .views { flex-wrap: wrap; gap: 10px 14px; }
+  .colophon { flex-basis: 100%; }
+  .ask-main { grid-template-columns: minmax(0, 1fr) auto; }
+  .sheet .inner { padding: 14px 14px 28px; }
+}
+
 /* ── Calendar (Schedule tab) ────────────────────────────────────────────── */
 #view-dash .column { max-width: 940px; }
 

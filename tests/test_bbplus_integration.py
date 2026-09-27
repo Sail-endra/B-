@@ -77,15 +77,18 @@ def test_bbplus_materials_cleanup_preserves_other_user_and_handles_regular_textb
         textbook.write_text(_text("consumer choice"), encoding="utf-8")
         ingest_files([bbplus, textbook], user_id="alice", course_id="ECON303", store=store)
         ingest_files([bbplus], user_id="bob", course_id="ECON303", store=store)
+        store.set_bbplus_course_mapping("alice", "blackboard-econ303", "Micro", "ECON303")
         assert {s.type for s in store.sources("alice", "ECON303")} == {
             SourceType.BBPLUS, SourceType.TEXTBOOK
         }
         alice_before = store.chunk_count_for_course("alice", "ECON303")
         bob_before = store.chunk_count_for_course("bob", "ECON303")
+        assert store.course_deletion_counts("alice", "ECON303")["materials"]["sources"] == 2
 
         store.delete_course_scope("alice", "ECON303", "materials")
         assert alice_before > 0 and store.chunk_count_for_course("alice", "ECON303") == 0
         assert store.chunk_count_for_course("bob", "ECON303") == bob_before > 0
+        assert store.bbplus_course_mapping("alice", "blackboard-econ303")["course_id"] == "ECON303"
         assert len(store.sources("bob", "ECON303")) == 1
     finally:
         store.close()

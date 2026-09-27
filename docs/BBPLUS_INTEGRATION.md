@@ -1,96 +1,127 @@
-# BB Plus Study Library integration
+# BB Plus + Course Copilot integration
 
-This repository is the Course Copilot (AI/UI) half. The BB Plus Chrome extension
-remains the source of Blackboard discovery, file downloading, and document
-parsing. Connect the two through the existing Course Copilot course-materials
-upload API; do not copy IndexedDB or Blackboard parsing code into this backend.
+BB Plus is the Blackboard-facing UI and owns Blackboard discovery, authenticated file access, document parsing, structured browser-local documents, and figure assets. Course Copilot is the canonical local service for searchable course materials, user/course isolation, ingestion, retrieval, refusal, providers, explanations, and citations. This is a Chrome extension plus one local service, not a second backend or a copied RAG implementation.
 
-## First integration contract
+## Data flow
 
-1. In the extension, call `chrome.runtime.sendMessage` with
-   `BBX_LIBRARY_QUERY` and `{ courseId: blackboardCourseId }`.
-2. Let the user map that Blackboard course ID to one Course Copilot `course_id`.
-   These are unrelated opaque identifiers: preserve the Blackboard ID as a
-   string and never assume it equals a Course Copilot ID. List Course Copilot
-   courses with `GET /api/courses`; the response has a `courses` array. Persist
-   the mapping in the extension, keyed by the Blackboard ID.
-3. For each returned document, use its `text` field from
-   `BBIR.flattenToText(doc)`. Do not send file bytes through extension runtime
-   messages. Side 2 does not retain original file bytes after parsing.
-4. From the extension service worker, upload each document as UTF-8 plain text
-   in the multipart form field named `files` to
-   `POST http://127.0.0.1:8471/api/courses/{course_id}/materials`. Send one or
-   more files in that field. Prefix the filename with `bbplus_` and include a
-   stable short hash of `itemId` plus a sanitized title, for example
-   `bbplus_a12bc34d_elasticity.txt`. Keep Blackboard IDs and raw titles out of
-   paths; the filename is metadata, not an authorization value.
-5. A successful upload returns HTTP 200 and JSON shaped like
-   `{"job_id":"…","course_id":"…","files":["bbplus_…txt"]}`. Poll
-   `GET http://127.0.0.1:8471/api/jobs/{job_id}`. The job object contains `id`,
-   `course_id`, `status`, `created_at`, `updated_at`, and `files`; each file
-   reports its filename, stage, page progress, chunk count, status, and detail.
-   Job states are `queued`, `running`, `done`, and `failed`. Stop polling on
-   `done` or `failed`; inspect per-file `status` (`ok`, `failed`, or
-   `unsupported`) and `detail`, because a completed job may include a file-level
-   extraction failure. A job belonging to another configured user returns 404.
+```text
+Blackboard signed-in tab
+  → BB Plus course discovery and parser
+  → BB Plus IndexedDB (structured blocks and local figure assets)
+  → explicit mapping: Blackboard course ID → Course Copilot course ID
+  → local BB Plus adapter route
+  → existing Course Copilot job and ingest_files pipeline
+  → chunks / embeddings / chapters in SQLite
+  → mapped-course retrieval and grounded answer
+```
 
-## Local API and security contract
+The browser IndexedDB and server SQLite remain because they hold different representations. BB Plus preserves full parsed IR and content-addressed assets; SQLite is the canonical retrieval index and application store. No images or Blackboard cookies are sent to the API. Text, LaTeX, tables, code, page/slide locations, and available image captions are sent only after the user selects **Sync BB Plus library**.
 
-- The materials route is `POST /api/courses/{course_id}/materials`; it accepts
-  multipart `files` fields and returns a background ingest job. Poll with
-  `GET /api/jobs/{job_id}`. Use `GET /api/courses` for course mapping.
-- There is currently **no authentication header or login**. The server assigns
-  every request to `default_user_id` (currently `local-user`). Job polling is
-  scoped to that configured user, but this is not multi-user authentication.
-  Keep the API bound to loopback (`127.0.0.1`); do not expose port 8471 to a
-  network. The extension must not accept a user-provided API URL. A future
-  networked deployment needs authentication and an origin allowlist.
-- The API currently allows cross-origin requests (`Access-Control-Allow-Origin:
-  *`). Browser extensions still need host permission for the local origin
-  (`http://127.0.0.1:8471/*`; include `http://localhost:8471/*` if users may
-  open the app through that host). Use the same hostname consistently for the
-  app and requests. The local API does not require a custom request header.
-- `course_id` is a Course Copilot identifier returned by the course list API;
-  it is not the Blackboard course ID. Blackboard course IDs are opaque strings
-  sent only to `BBX_LIBRARY_QUERY` and retained in the extension's mapping.
-- `BBX_LIBRARY_QUERY` results must have a readable `text` string from
-  `BBIR.flattenToText(doc)`. Upload that string encoded as UTF-8. Empty strings
-  should be skipped. Course Copilot computes a SHA-256 hash of uploaded bytes;
-  an unchanged file in the same user/course is skipped as “reused”. A changed
-  document should keep its stable `itemId`-based filename so the existing source
-  is refreshed rather than duplicated.
-- The app must be running locally and accept connections on port 8471. There is
-  no additional BB Plus environment variable. Existing Course Copilot provider,
-  offline, and consent settings govern later AI actions; ingest itself uses the
-  configured embedder. `.env` values stay in Course Copilot and must never be
-  copied into extension storage or messages.
+## Setup and permissions
 
-The extension service worker will need host permission for the local Course
-Copilot origin (`http://127.0.0.1:8471/*`; include the `localhost` variant if
-the app is accessed that way). Keep the extension's existing Blackboard host
-permission narrow. This bridge transfers parsed text to the local app; it does
-not directly contact an external service. Subsequent AI actions remain subject
-to Course Copilot's existing provider and consent settings.
+1. Start Course Copilot on this computer at `http://127.0.0.1:8471`.
+2. Load this repository’s `extension/` directory in Chrome using `chrome://extensions` → Developer mode → **Load unpacked**.
+3. From the extension popup, enable BB Plus on the current Blackboard HTTPS origin.
+4. Choose **Connect Course Copilot** in that popup. The optional host permission is limited to `http://127.0.0.1:8471/*`.
+5. In the drawer, select a Blackboard course. Map it to an existing Course Copilot course or create and map a new course.
+6. Use **Sync BB Plus library**, wait for the indexing job to finish, and then Ask a question from that course.
 
-## Why this boundary is merge-friendly
+The popup never asks for or stores a provider key. The extension API URL is fixed to loopback and is not configurable by page content. Disconnecting in the popup removes the optional local-server permission.
 
-Course Copilot processes the text through its existing upload, chunking,
-embedding, and indexing flow. The resulting sources use type `bbplus`, so they
-remain identifiable and are included in the Materials-only cleanup scope. No
-retrieval, refusal-gate, or evaluation behavior needs a separate BB Plus path.
-The source hash is computed from the imported text by the existing ingest flow,
-making identical exports idempotent while their indexed source remains present.
+## API contract
 
-The initial bridge intentionally uses the stable flattened-text API. Flattening
-omits images and math blocks, and may lose some table structure. Original PDFs
-and images are not available from the current BB Plus library after parsing.
-Preserving structured blocks or assets should be a separately versioned API
-extension once both repositories are available; do not silently treat flattened
-text as a lossless copy.
+All integration handlers use `current_user()` from the server. The extension sends no `user_id`. Product integration routes reject the reserved `benchmark` user. The Blackboard course ID is treated as an opaque string and is never assumed to equal the Course Copilot ID.
 
-## Shared ownership
+### Read local state
 
-Only the extension repository should change its scan, download, IndexedDB, and
-parser logic. Only this repository should decide how imported text enters the
-Course Copilot corpus. Keep the adapter contract above as the seam when both
-codebases are brought together on the other device.
+`GET /api/integrations/bbplus/state`
+
+```json
+{
+  "courses": [{
+    "course_id": "econ303",
+    "code": "ECON303",
+    "title": "Intermediate Microeconomics",
+    "term": "Fall",
+    "chunks": 12,
+    "sources": [{"source_id": "…", "title": "…", "pages": 49, "status": "ok"}]
+  }],
+  "mappings": [{
+    "blackboard_course_id": "opaque-blackboard-id",
+    "blackboard_course_name": "Intermediate Microeconomics",
+    "course_id": "econ303"
+  }]
+}
+```
+
+### Map an existing course
+
+`PUT /api/integrations/bbplus/course-mappings/{blackboard_course_id}`
+
+```json
+{"course_id": "econ303", "course_name": "Intermediate Microeconomics"}
+```
+
+The server returns 404 if that course is not owned by the current user. The mapping is stored by `(user_id, blackboard_course_id)` and removed when its Course Copilot course is fully deleted. Materials-only and syllabus-only cleanup retain the map.
+
+### Create and map a course
+
+`POST /api/integrations/bbplus/course-mappings/{blackboard_course_id}/create`
+
+```json
+{"code": "ECON303", "title": "Intermediate Microeconomics", "term": "Fall"}
+```
+
+The server creates the Course Copilot course under the configured user and maps the Blackboard ID to it.
+
+### Sync structured documents
+
+`POST /api/integrations/bbplus/course-mappings/{blackboard_course_id}/materials`
+
+```json
+{
+  "documents": [{
+    "item_id": "stable-blackboard-item-id",
+    "course_id": "opaque-blackboard-id",
+    "title": "Budget Line",
+    "source_type": "pdf",
+    "blocks": [
+      {"type": "heading", "level": 2, "text": "Budget constraint", "page": 49},
+      {"type": "paragraph", "text": "…", "page": 49},
+      {"type": "math", "latex": "p_x x + p_y y = m", "page": 50},
+      {"type": "table", "rows": [["Item", "Value"]]}
+    ]
+  }]
+}
+```
+
+Supported blocks retain their hierarchy/readable content, including tables, equations, code, captions, and page/slide markers. Image pixels and unparsed blocks are not represented as searchable prose. If an item has no readable text, table, equation, code, or caption, the route returns 422 with code `unreadable_material` and a human-readable reason. A document course ID that differs from the route course ID returns 409. The batch limit is 100 documents and 24 MB serialized text; a single document is limited to 2 MB of text.
+
+The returned `job_id` is polled through the normal `GET /api/jobs/{job_id}` contract. Job lookup remains scoped to the current server user. Job files expose queued/running/done/failed status, extraction progress, chunk counts, and file-level errors. A terminal `done` job may still contain an individual unsupported/failed file, so inspect the `files` rows.
+
+The adapter generates a stable filename from a hash of the Blackboard item ID. The display title stays in the document content, so a title change does not change the source identity. Filenames are metadata only. The existing ingest service computes a SHA-256 hash of serialized content: an unchanged document for that stable item is reused, and changed content replaces that item's BB Plus source and chunks. Distinct Blackboard items remain distinct sources even if their content matches. Sources retain type `bbplus` and are covered by the existing Materials-only cleanup.
+
+### Ask the mapped course
+
+`POST /api/integrations/bbplus/course-mappings/{blackboard_course_id}/ask`
+
+```json
+{"question": "What determines the slope of the budget line?", "depth": "concise"}
+```
+
+`depth` is `concise` or `in_depth`. The adapter resolves the map for the current user and invokes the existing `Agent` with the Course Copilot course ID. It returns the same fields as `/api/ask`: answer, explanation, provider/backend label, refusal state, and source/chapter/page citations.
+
+## Persistence and migration
+
+`bbplus_course_mappings` is added by the normal idempotent schema initialization. Existing databases are not deleted, reseeded, or renamed. Course IDs, source IDs, and chunk IDs are unchanged. The only additional persistent relationship is the user-scoped Blackboard mapping. On full-course deletion, the generic user-and-course scoped deletion also removes these mappings in the same SQLite transaction.
+
+Each Course Copilot chunk continues to be scoped to `user_id`, `course_id`, and its stable chunk ID. Existing per-user vector caches are invalidated by normal ingestion and deletion hooks. No integration request can set its own tenant ID or map to another user’s course.
+
+## Security boundary and limits
+
+- The API has no login. `default_user_id` is the local product user; keep Uvicorn bound to loopback and do not expose port 8471 to a network.
+- CORS allows the local app and Chrome extension origins; browser requests with an unrelated `Origin` cannot mutate the API. This is a local development protection, not network authentication.
+- Chrome asks for Blackboard site permission and Course Copilot loopback permission separately. The latter can be revoked in the extension popup.
+- `.env`, provider API keys, cookies, and Blackboard credentials remain outside extension messages and storage.
+- Re-indexing is Course Copilot’s canonical pipeline. The existing content-hash cache avoids repeat extraction/embedding for unchanged serialized content while its source remains indexed.
+- BB Plus retains complete structural IR and local image assets; Course Copilot currently retrieves text and captions only. Vision retrieval would need a separately designed backend contract.

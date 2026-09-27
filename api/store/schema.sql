@@ -26,6 +26,20 @@ CREATE TABLE IF NOT EXISTS courses (
     PRIMARY KEY (user_id, course_id)
 );
 
+-- Stable Blackboard identity is metadata mapped to the canonical Course
+-- Copilot course. Titles and filenames are never used as authorization keys.
+CREATE TABLE IF NOT EXISTS bbplus_course_mappings (
+    user_id               TEXT NOT NULL,
+    blackboard_course_id  TEXT NOT NULL,
+    blackboard_course_name TEXT NOT NULL DEFAULT '',
+    course_id             TEXT NOT NULL,
+    created_at            TEXT NOT NULL DEFAULT '',
+    updated_at            TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (user_id, blackboard_course_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bbplus_mapping_course
+    ON bbplus_course_mappings(user_id, course_id);
+
 CREATE TABLE IF NOT EXISTS sources (
     source_id  TEXT NOT NULL,
     user_id    TEXT NOT NULL,

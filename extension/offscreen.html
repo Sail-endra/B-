@@ -1,0 +1,35 @@
+<!doctype html>
+<!--
+  Offscreen document: a hidden, DOM-capable extension page used purely as a
+  headless parser. It has no visible window and is never shown to the user.
+  Manifest V3 forbids remotely-hosted code in extension pages, so every
+  parser library referenced below must be a file physically checked into
+  vendor/ at build time - none of them are loaded from a CDN. See
+  vendor/README.md for exactly what to drop in and where to get it.
+
+  Each <script> below is loaded only if present; offscreen.js feature-detects
+  each library and degrades a source it can't parse yet into an "unparsed"
+  IR block instead of failing the whole ingestion run.
+-->
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+  <script src="lib/ir.js"></script>
+  <script src="lib/db.js"></script>
+
+  <!-- Optional, vendored: PDF text + page-image extraction. Missing/failed
+       loads are handled by the `typeof pdfjsLib === "undefined"` checks in
+       offscreen.js, not by removing this tag - MV3's extension-page CSP
+       blocks inline event handlers like onerror="...", so that never ran. -->
+  <script src="vendor/pdf.min.js"></script>
+
+  <!-- Optional, vendored: DOCX -> HTML (including inline images as data URIs). -->
+  <script src="vendor/mammoth.browser.min.js"></script>
+
+  <!-- Optional, vendored: zip reading, used for PPTX (and DOCX's own zip if
+       mammoth isn't present but a fallback text-only PPTX/DOCX path is). -->
+  <script src="vendor/jszip.min.js"></script>
+
+  <script src="offscreen.js"></script>
+</body>
+</html>

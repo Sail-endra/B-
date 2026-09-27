@@ -254,9 +254,18 @@ def ingest_files(
         filename = path.name
         source_id = _source_id(course_id, filename)
         report_progress(i, stage="reading", pages_done=0, pages_total=0)
+        display_title = Path(filename).stem.replace("_", " ")[:80]
+        if filename.lower().startswith("bbplus_") and path.suffix.lower() == ".md":
+            try:
+                with path.open("r", encoding="utf-8") as imported:
+                    first_line = imported.readline(1000).strip()
+                if first_line.startswith("# "):
+                    display_title = first_line[2:].strip()[:300] or display_title
+            except (OSError, UnicodeError):
+                pass
         source = Source(
             source_id=source_id, user_id=user_id, course_id=course_id,
-            title=Path(filename).stem.replace("_", " ")[:80],
+            title=display_title,
             type=_guess_type(filename), file=str(path),
         )
 
@@ -266,7 +275,8 @@ def ingest_files(
         except Exception:  # noqa: BLE001
             file_hash = ""
         source.file_hash = file_hash
-        if file_hash and store.source_with_hash(user_id, course_id, file_hash):
+        reusable_source_id = source_id if source.type is SourceType.BBPLUS else None
+        if file_hash and store.source_with_hash(user_id, course_id, file_hash, reusable_source_id):
             report.files.append(FileReport(filename, source_id, "ok",
                                            detail="unchanged since last upload (reused)"))
             report_progress(i, stage="reused", status="ok",

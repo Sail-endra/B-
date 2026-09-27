@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -42,6 +42,7 @@ from .dashboard.readiness import (
 from .retrieval.pipeline import RetrievalPipeline
 from .corpus.ingest_service import ingest_files, slugify
 from .corpus.ingest_service import _source_id
+from .integrations.bbplus import safe_material_filename, serialize_document
 from .models import Source, SourceType
 from .store import get_store
 from .syllabus.commit import commit as commit_syllabus
@@ -54,10 +55,23 @@ logger = logging.getLogger(__name__)
 voice_service = ElevenLabsService(settings)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://127.0.0.1:8471", "http://localhost:8471"],
+    allow_origin_regex=r"^chrome-extension://[a-p]{32}$",
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["content-type", "accept"],
 )
+
+
+@app.middleware("http")
+async def reject_cross_site_mutations(request, call_next):
+    """Block browser CSRF-style writes while allowing the local UI and extension."""
+    origin = request.headers.get("origin")
+    if origin and request.method not in {"GET", "HEAD", "OPTIONS"}:
+        local_origins = {"http://127.0.0.1:8471", "http://localhost:8471"}
+        extension_origin = re.fullmatch(r"chrome-extension://[a-p]{32}", origin)
+        if origin not in local_origins and not extension_origin:
+            return JSONResponse(status_code=403, content={"detail": "Cross-site writes are not allowed."})
+    return await call_next(request)
 
 WEB_DIR = ROOT / "web"
 UPLOAD_DIR = ROOT / "data" / "uploads"
@@ -152,6 +166,34 @@ class CourseDeletionRequest(BaseModel):
     select_all: bool = False
 
 
+class BBPlusCourseRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=80)
+    title: str = Field(default="", max_length=300)
+    term: str = Field(default="", max_length=120)
+
+
+class BBPlusMappingRequest(BaseModel):
+    course_id: str = Field(min_length=1, max_length=120)
+    course_name: str = Field(default="", max_length=300)
+
+
+class BBPlusDocument(BaseModel):
+    item_id: str = Field(min_length=1, max_length=300)
+    course_id: str = Field(default="", max_length=300)
+    title: str = Field(default="Blackboard material", max_length=500)
+    source_type: str = Field(default="unknown", max_length=40)
+    blocks: list[dict[str, Any]] = Field(default_factory=list, max_length=20000)
+
+
+class BBPlusSyncRequest(BaseModel):
+    documents: list[BBPlusDocument] = Field(min_length=1, max_length=100)
+
+
+class BBPlusAskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=12000)
+    depth: str = "concise"
+
+
 # ---------------------------------------------------------------------------
 # Meta
 # ---------------------------------------------------------------------------
@@ -196,6 +238,115 @@ def courses() -> dict[str, Any]:
             }
         )
     return {"courses": out}
+
+
+def _require_non_benchmark_product_user() -> str:
+    user = current_user()
+    if user == "benchmark":
+        raise HTTPException(403, detail={"code": "benchmark_read_only", "message": "The benchmark corpus is not available to product integrations."})
+    return user
+
+
+@app.get("/api/integrations/bbplus/state")
+def bbplus_state() -> dict[str, Any]:
+    user = _require_non_benchmark_product_user()
+    store = get_store()
+    return {
+        "courses": [
+            {"course_id": c.course_id, "code": c.code, "title": c.title, "term": c.term,
+             "chunks": store.chunk_count_for_course(user, c.course_id),
+             "sources": [{"source_id": s.source_id, "title": s.title, "pages": s.pages,
+                         "status": s.status} for s in store.sources(user, c.course_id)]}
+            for c in store.courses(user)
+        ],
+        "mappings": store.bbplus_course_mappings(user),
+    }
+
+
+@app.post("/api/integrations/bbplus/course-mappings/{blackboard_course_id}/create")
+def create_and_map_bbplus_course(blackboard_course_id: str,
+                                 request: BBPlusCourseRequest) -> dict[str, Any]:
+    user = _require_non_benchmark_product_user()
+    store = get_store()
+    external_hash = hashlib.sha256(blackboard_course_id.encode("utf-8")).hexdigest()[:8]
+    course_id = f"{slugify(request.code)}_bbx_{external_hash}"
+    title = request.title.strip() or request.code.strip()
+    store.upsert_course_stub(user, course_id, request.code.strip(), title)
+    course = store.course(user, course_id)
+    if course:
+        course.term = request.term.strip()
+        store.upsert_course(course)
+    try:
+        store.set_bbplus_course_mapping(user, blackboard_course_id,
+                                        request.code.strip() or title, course_id)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(400, detail={"code": "mapping_failed", "message": str(exc)}) from exc
+    return {"course_id": course_id, "code": request.code.strip(), "title": title,
+            "term": request.term.strip(), "blackboard_course_id": blackboard_course_id}
+
+
+@app.put("/api/integrations/bbplus/course-mappings/{blackboard_course_id}")
+def set_bbplus_mapping(blackboard_course_id: str, request: BBPlusMappingRequest) -> dict[str, Any]:
+    user = _require_non_benchmark_product_user()
+    store = get_store()
+    try:
+        store.set_bbplus_course_mapping(user, blackboard_course_id,
+                                        request.course_name.strip(), request.course_id)
+    except KeyError as exc:
+        raise HTTPException(404, detail={"code": "course_not_found", "message": str(exc)}) from exc
+    except ValueError as exc:
+        raise HTTPException(400, detail={"code": "invalid_mapping", "message": str(exc)}) from exc
+    return {"blackboard_course_id": blackboard_course_id,
+            "blackboard_course_name": request.course_name.strip(), "course_id": request.course_id}
+
+
+@app.post("/api/integrations/bbplus/course-mappings/{blackboard_course_id}/materials")
+def sync_bbplus_materials(blackboard_course_id: str, request: BBPlusSyncRequest) -> dict[str, Any]:
+    user = _require_non_benchmark_product_user()
+    store = get_store()
+    mapping = store.bbplus_course_mapping(user, blackboard_course_id)
+    if mapping is None:
+        raise HTTPException(409, detail={"code": "course_mapping_required", "message": "Map this Blackboard course to a Course Copilot course first."})
+    if store.course(user, mapping["course_id"]) is None:
+        raise HTTPException(409, detail={"code": "mapped_course_missing", "message": "The mapped Course Copilot course no longer exists. Choose a course again."})
+
+    prepared: list[tuple[str, str]] = []
+    total_chars = 0
+    try:
+        for document in request.documents:
+            if document.course_id and document.course_id != blackboard_course_id:
+                raise HTTPException(409, detail={"code": "course_mismatch", "message": "A document belongs to a different Blackboard course."})
+            content = serialize_document(document.title, document.blocks)
+            total_chars += len(content)
+            if total_chars > 24_000_000:
+                raise HTTPException(413, detail={"code": "sync_batch_too_large", "message": "Sync up to 24 MB of extracted text at a time."})
+            prepared.append((safe_material_filename(document.item_id, document.title), content))
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "unreadable_material", "message": str(exc)}) from exc
+
+    destination = UPLOAD_DIR / user / mapping["course_id"]
+    destination.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for filename, content in prepared:
+        target = destination / filename
+        target.write_text(content, encoding="utf-8")
+        paths.append(target)
+    return _start_material_ingest(paths, mapping["course_id"], user, store)
+
+
+@app.post("/api/integrations/bbplus/course-mappings/{blackboard_course_id}/ask")
+async def ask_bbplus_course(blackboard_course_id: str, request: BBPlusAskRequest) -> dict[str, Any]:
+    user = _require_non_benchmark_product_user()
+    if request.depth not in {"concise", "in_depth"}:
+        raise HTTPException(400, detail={"code": "invalid_depth", "message": "Depth must be concise or in_depth."})
+    mapping = get_store().bbplus_course_mapping(user, blackboard_course_id)
+    if mapping is None or get_store().course(user, mapping["course_id"]) is None:
+        raise HTTPException(409, detail={"code": "course_mapping_required", "message": "Map this Blackboard course to a Course Copilot course first."})
+    if not request.question.strip():
+        raise HTTPException(400, detail={"code": "empty_question", "message": "Enter a question first."})
+    agent = Agent(pipeline(), user_id=user)
+    answer = await agent.ask_async(request.question, mapping["course_id"], depth=request.depth)
+    return answer.to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -1092,19 +1243,9 @@ async def create_course(code: str = Form(...), title: str = Form("")) -> dict[st
     return {"course_id": course_id, "code": code, "title": title or code}
 
 
-@app.post("/api/courses/{course_id}/materials")
-async def upload_materials(course_id: str, files: list[UploadFile]) -> dict[str, Any]:
-    """Upload textbooks/readings. Returns a job id immediately; a worker thread
-    runs extraction/OCR/embedding in the background and reports per-file progress
-    the UI polls at /api/jobs/{id}. The user is never blocked, and each document
-    becomes searchable as it finishes."""
-    user = current_user()
-    if not files:
-        raise HTTPException(400, "no files uploaded")
-    paths = _save_uploads(files, UPLOAD_DIR / user / course_id)
-    store = get_store()
+def _start_material_ingest(paths: list[Path], course_id: str, user: str, store) -> dict[str, Any]:
+    """Create one ordinary Course Copilot ingest job for any trusted adapter."""
     course = store.course(user, course_id)
-
     job_id = uuid.uuid4().hex
     file_records = [
         {"filename": p.name, "stage": "queued", "pages_done": 0, "pages_total": 0,
@@ -1137,13 +1278,29 @@ async def upload_materials(course_id: str, files: list[UploadFile]) -> dict[str,
             store.update_job(job_id, status="done")
         except Exception as exc:  # noqa: BLE001 - surface, never crash the server
             job = store.get_job(job_id, user) or {"files": file_records}
-            store.update_job(job_id, status="failed", files=job["files"])
+            logger.error("Material ingest job failed (%s).", type(exc).__name__)
+            failed_files = job["files"]
+            for item in failed_files:
+                if item.get("status") not in {"failed", "unsupported"}:
+                    item.update(stage="failed", status="failed",
+                                detail="Indexing could not finish. Retry the sync; see the local server log if it happens again.")
+            store.update_job(job_id, status="failed", files=failed_files)
         finally:
             invalidate_pipeline(user)
 
     threading.Thread(target=worker, name=f"ingest-{job_id[:8]}", daemon=True).start()
     return {"job_id": job_id, "course_id": course_id,
             "files": [f["filename"] for f in file_records]}
+
+
+@app.post("/api/courses/{course_id}/materials")
+async def upload_materials(course_id: str, files: list[UploadFile]) -> dict[str, Any]:
+    """Upload textbooks/readings through the canonical asynchronous ingest path."""
+    user = current_user()
+    if not files:
+        raise HTTPException(400, "no files uploaded")
+    paths = _save_uploads(files, UPLOAD_DIR / user / course_id)
+    return _start_material_ingest(paths, course_id, user, get_store())
 
 
 @app.get("/api/jobs/{job_id}")

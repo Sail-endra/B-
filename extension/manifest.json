@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "BB Plus",
+  "version": "2.10.0",
+  "description": "Blackboard study library and Course Copilot AI course assistant.",
+  "minimum_chrome_version": "102",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "offscreen",
+    "unlimitedStorage"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://127.0.0.1:8471/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "BB Plus",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "bb-plus-16.png",
+      "32": "bb-plus-32.png",
+      "48": "bb-plus-48.png",
+      "128": "bb-plus-128.png"
+    }
+  },
+  "short_name": "BB Plus",
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "BB Plus.png",
+        "bb-plus.png"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ],
+  "icons": {
+    "16": "bb-plus-16.png",
+    "32": "bb-plus-32.png",
+    "48": "bb-plus-48.png",
+    "128": "bb-plus-128.png"
+  }
+}
